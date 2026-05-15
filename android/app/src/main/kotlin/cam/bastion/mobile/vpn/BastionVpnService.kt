@@ -24,6 +24,27 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicInteger
+
+/**
+ * Hostnames that the Android system uses to validate that the active network
+ * has working internet. If we ever NXDOMAIN one of these (or our response
+ * packet is malformed enough that the kernel drops it), Android marks the
+ * network as "no internet" and the flag survives the VPN being torn down
+ * — the user has to reset network settings to recover. Always fast-forward
+ * these to upstream and never apply blocklist matching to them.
+ */
+private val SYSTEM_PROBE_HOSTS = setOf(
+    "connectivitycheck.gstatic.com",
+    "connectivitycheck.android.com",
+    "www.google.com",
+    "clients3.google.com",
+    "clients4.google.com",
+    "play.googleapis.com",
+    "mtalk.google.com",
+    "android.clients.google.com",
+    "captive.apple.com",
+)
 
 /**
  * BASTION DNS sinkhole VPN.
@@ -156,7 +177,8 @@ class BastionVpnService : VpnService() {
             val originalSrcPort = ((buf[ihl].toInt() and 0xFF) shl 8) or (buf[ihl + 1].toInt() and 0xFF)
 
             val hostname = parseDnsQuestion(dnsPayload) ?: continue
-            if (BlocklistRepo.isBlocked(hostname)) {
+            val isProbe = hostname.lowercase().trimEnd('.') in SYSTEM_PROBE_HOSTS
+            if (!isProbe && BlocklistRepo.isBlocked(hostname)) {
                 Log.i(TAG, "BLOCKED $hostname")
                 runCatching {
                     auditDao.insert(AuditEvent(ts = System.currentTimeMillis(),
@@ -202,23 +224,52 @@ class BastionVpnService : VpnService() {
     }
 
     /**
-     * Build a minimal NXDOMAIN response from the original query.
-     * Sets QR=1, RA=1, RCODE=3 (NXDOMAIN). Answer/authority/additional counts
-     * stay at the query's defaults (0). The question section is preserved
-     * verbatim so the app's resolver matches transaction-ID + question.
+     * Build a NXDOMAIN response from the original query that includes a SOA
+     * record in the AUTHORITY section so resolvers cap negative-cache TTL
+     * at 60 seconds (RFC 2308). Without a SOA, some Android resolvers cache
+     * NXDOMAINs indefinitely — a single false-positive block would then
+     * persist for the lifetime of the network connection.
      */
     private fun synthesizeNxDomain(query: ByteArray): ByteArray {
-        val resp = query.copyOf()
-        if (resp.size < 12) return resp
-        // Byte 2: QR(1) Opcode(0) AA(0) TC(0) RD(preserve)
-        resp[2] = ((resp[2].toInt() and 0x01) or 0x80).toByte()
-        // Byte 3: RA(1) Z(0) RCODE(3 = NXDOMAIN)
-        resp[3] = (0x80 or 0x03).toByte()
-        // Zero answer/authority/additional counts.
-        resp[6] = 0; resp[7] = 0
-        resp[8] = 0; resp[9] = 0
-        resp[10] = 0; resp[11] = 0
-        return resp
+        if (query.size < 12) return query
+        // Find end of question section (skip name + 4 bytes for QTYPE+QCLASS).
+        var qEnd = 12
+        while (qEnd < query.size) {
+            val len = query[qEnd].toInt() and 0xFF
+            if (len == 0) { qEnd += 1; break }
+            if (len > 63 || qEnd + 1 + len > query.size) return query
+            qEnd += 1 + len
+        }
+        qEnd += 4 // QTYPE + QCLASS
+        if (qEnd > query.size) return query
+
+        // SOA RR for root ".", TTL=60, MNAME="." (1 byte 0x00), RNAME="." (1 byte 0x00),
+        // SERIAL=1, REFRESH/RETRY/EXPIRE=3600/600/86400, MINIMUM=60.
+        val soa = ByteBuffer.allocate(35).apply {
+            put(0x00.toByte())                       // NAME = root
+            putShort(0x0006.toShort())               // TYPE = SOA
+            putShort(0x0001.toShort())               // CLASS = IN
+            putInt(60)                               // TTL
+            putShort(22.toShort())                   // RDLENGTH
+            put(0x00.toByte())                       // MNAME root
+            put(0x00.toByte())                       // RNAME root
+            putInt(1)                                // SERIAL
+            putInt(3600); putInt(600); putInt(86400) // REFRESH/RETRY/EXPIRE
+            putInt(60)                               // MINIMUM (the negative-cache TTL)
+        }.array()
+
+        val resp = ByteBuffer.allocate(qEnd + soa.size)
+        resp.put(query, 0, qEnd)
+        resp.put(soa)
+        val out = resp.array()
+        // Header: QR=1, RA=1, RCODE=3 (NXDOMAIN), preserve RD.
+        out[2] = ((query[2].toInt() and 0x01) or 0x80).toByte()
+        out[3] = (0x80 or 0x03).toByte()
+        // ANCOUNT=0, NSCOUNT=1, ARCOUNT=0
+        out[6] = 0; out[7] = 0
+        out[8] = 0; out[9] = 1
+        out[10] = 0; out[11] = 0
+        return out
     }
 
     private fun parseDnsQuestion(dns: ByteArray): String? {
@@ -235,6 +286,8 @@ class BastionVpnService : VpnService() {
         return if (labels.isEmpty()) null else labels.joinToString(".")
     }
 
+    private val ipIdCounter = AtomicInteger(1)
+
     private fun wrapIpv4Udp(srcAddr: ByteArray, dstAddr: ByteArray,
                             srcPort: Int, dstPort: Int, payload: ByteArray): ByteArray {
         val totalLen = 20 + 8 + payload.size
@@ -243,11 +296,11 @@ class BastionVpnService : VpnService() {
         out.put(0x45.toByte())                              // ver+ihl
         out.put(0)                                          // dscp
         out.putShort(totalLen.toShort())                    // total len
-        out.putShort(0)                                     // id
+        out.putShort((ipIdCounter.getAndIncrement() and 0xFFFF).toShort()) // id
         out.putShort(0x4000.toShort())                      // flags=DF
         out.put(64)                                         // ttl
         out.put(17)                                         // proto=UDP
-        out.putShort(0)                                     // checksum (0 = OS recompute on tun)
+        out.putShort(0)                                     // checksum (computed below)
         out.put(srcAddr); out.put(dstAddr)
         // recompute IP checksum
         val ip = out.array()
@@ -257,12 +310,34 @@ class BastionVpnService : VpnService() {
         val cksum = sum.inv() and 0xFFFF
         ip[10] = (cksum shr 8).toByte(); ip[11] = (cksum and 0xFF).toByte()
         // UDP header
+        val udpLen = 8 + payload.size
         out.putShort(srcPort.toShort())
         out.putShort(dstPort.toShort())
-        out.putShort((8 + payload.size).toShort())
-        out.putShort(0) // udp checksum optional in IPv4
+        out.putShort(udpLen.toShort())
+        out.putShort(0)                                     // checksum placeholder
         out.put(payload)
-        return out.array()
+        // Compute UDP checksum over pseudo-header + UDP header + payload.
+        // Some Android cellular paths drop UDP/53 packets with checksum=0 as
+        // malformed, which manifests as ConnectivityService marking the network
+        // "no internet" — a state that survives the VPN tearing down.
+        val arr = out.array()
+        var us = 0
+        // pseudo-header: src(4) + dst(4) + 0x00 + proto(1) + udpLen(2)
+        for (k in 12 until 20 step 2) us += ((arr[k].toInt() and 0xFF) shl 8) or (arr[k + 1].toInt() and 0xFF)
+        us += 17                          // protocol
+        us += udpLen                      // udp length (again)
+        // udp header + payload, treating payload as 16-bit words (pad odd byte with 0)
+        var k = 20
+        while (k + 1 < arr.size) {
+            us += ((arr[k].toInt() and 0xFF) shl 8) or (arr[k + 1].toInt() and 0xFF)
+            k += 2
+        }
+        if (k < arr.size) us += (arr[k].toInt() and 0xFF) shl 8
+        while (us shr 16 != 0) us = (us and 0xFFFF) + (us shr 16)
+        var udpCk = us.inv() and 0xFFFF
+        if (udpCk == 0) udpCk = 0xFFFF    // RFC 768: 0 means "no checksum", use 0xFFFF instead
+        arr[26] = (udpCk shr 8).toByte(); arr[27] = (udpCk and 0xFF).toByte()
+        return arr
     }
 
     override fun onRevoke() {
