@@ -43,7 +43,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import cam.bastion.mobile.acoustic.AcousticShieldService
-import cam.bastion.mobile.echo.UltrasonicMonitor
 import cam.bastion.mobile.net.NetworkUsage
 import cam.bastion.mobile.scan.ShadowScanner
 import cam.bastion.mobile.settings.Settings
@@ -67,10 +66,9 @@ class MainActivity : ComponentActivity() {
 private enum class Tab(val short: String, val long: String) {
     DNS("01", "dns"),
     SHIELD("02", "shield"),
-    ECHO("03", "echo"),
-    NET("04", "net"),
-    SCAN("05", "scan"),
-    ABOUT("06", "about"),
+    NET("03", "net"),
+    SCAN("04", "scan"),
+    ABOUT("05", "about"),
 }
 
 @Composable
@@ -84,7 +82,6 @@ fun BastionApp() {
                 when (tab) {
                     Tab.DNS -> DnsScreen()
                     Tab.SHIELD -> ShieldScreen()
-                    Tab.ECHO -> EchoScreen()
                     Tab.NET -> NetScreen()
                     Tab.SCAN -> ScanScreen()
                     Tab.ABOUT -> AboutScreen()
@@ -106,7 +103,7 @@ private fun TopBar(tab: Tab) {
         Column(Modifier.weight(1f)) {
             Text("BASTION", color = PHOSPHOR, fontFamily = MONO, fontSize = 22.sp,
                 fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
-            Text("v0.4.1 :: ${tab.short} ${tab.long}", color = INK_DIM,
+            Text("v0.4.2 :: ${tab.short} ${tab.long}", color = INK_DIM,
                 fontFamily = MONO, fontSize = 10.sp, letterSpacing = 2.sp)
         }
         Pulse()
@@ -644,165 +641,6 @@ private fun BigSliderInt(label: String, valueLabel: String, value: Int, range: I
     }
 }
 
-/* ───────────────────────── ECHO (ultrasonic monitor) ───────────────────────── */
-
-private val echoMonitor = UltrasonicMonitor()
-
-@Composable
-private fun EchoScreen() {
-    val ctx = LocalContext.current
-    var hasMicPerm by remember { mutableStateOf(
-        ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO)
-            == PackageManager.PERMISSION_GRANTED
-    ) }
-    var running by remember { mutableStateOf(echoMonitor.running) }
-    var frame by remember { mutableStateOf(echoMonitor.latest) }
-    var sustainedMs by remember { mutableLongStateOf(0L) }
-
-    val micPerm = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        hasMicPerm = granted
-        if (granted) running = echoMonitor.start()
-    }
-
-    LaunchedEffect(running) {
-        var lastAlertTs = 0L
-        while (running) {
-            frame = echoMonitor.latest
-            // Sustained-narrowband heuristic: peak louder than -55 dBFS for >1s.
-            val now = System.currentTimeMillis()
-            if (frame.peakDb > -55f) {
-                if (lastAlertTs == 0L) lastAlertTs = now
-                sustainedMs = now - lastAlertTs
-            } else {
-                lastAlertTs = 0L
-                sustainedMs = 0L
-            }
-            delay(80)
-        }
-    }
-    DisposableEffect(Unit) { onDispose { echoMonitor.stop(); running = false } }
-
-    val beaconAlert = sustainedMs > 1000L
-
-    Column(
-        Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(top = 18.dp)
-            .verticalScroll(rememberScrollState())
-    ) {
-        EchoStatusPanel(running, frame, beaconAlert)
-        Spacer(Modifier.height(14.dp))
-        ActionButton(if (running) "STOP MONITOR" else "START MONITOR") {
-            if (running) {
-                echoMonitor.stop(); running = false; sustainedMs = 0L
-            } else if (!hasMicPerm) {
-                micPerm.launch(Manifest.permission.RECORD_AUDIO)
-            } else {
-                running = echoMonitor.start()
-            }
-        }
-        Spacer(Modifier.height(20.dp))
-        SectionHeader("18 - 22 khz spectrum")
-        Spacer(Modifier.height(8.dp))
-        SpectrumCanvas(frame.buckets, running)
-        Spacer(Modifier.height(20.dp))
-        Disclaimer(
-            "ECHO surfaces energy in the ultrasonic band where SilverPush-style " +
-                "cross-device tracking beacons live. We don't claim every spike is " +
-                "a beacon — wind, fingernails on glass, and CRT flyback can chirp " +
-                "here too. Sustained narrowband peaks > -55 dBFS for >1 s are the " +
-                "suspicious pattern. Phone mics roll off above ~22 kHz."
-        )
-        Spacer(Modifier.height(20.dp))
-    }
-}
-
-@Composable
-private fun EchoStatusPanel(running: Boolean, frame: UltrasonicMonitor.Frame, alert: Boolean) {
-    val color = when {
-        alert -> AMBER
-        running -> PHOSPHOR
-        else -> INK_DIM
-    }
-    Column(
-        Modifier.fillMaxWidth()
-            .background(SURFACE, RoundedCornerShape(4.dp))
-            .border(1.dp, BORDER, RoundedCornerShape(4.dp))
-            .padding(16.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("STATUS", color = INK_DIM, fontFamily = MONO, fontSize = 10.sp,
-                letterSpacing = 2.sp, modifier = Modifier.weight(1f))
-            if (running) Pulse()
-        }
-        Spacer(Modifier.height(4.dp))
-        Text(
-            when {
-                alert -> "BEACON SUSPECTED"
-                running -> "LISTENING"
-                else -> "IDLE"
-            },
-            color = color, fontFamily = MONO, fontSize = 22.sp,
-            fontWeight = FontWeight.Bold, letterSpacing = 3.sp,
-        )
-        Spacer(Modifier.height(12.dp))
-        KvLine("peak freq", "%.0f Hz".format(frame.peakHz))
-        KvLine("peak level", "%.1f dBFS".format(frame.peakDb))
-        KvLine("band", "18 000 - 22 000 Hz")
-    }
-}
-
-@Composable
-private fun SpectrumCanvas(buckets: FloatArray, running: Boolean) {
-    Canvas(
-        Modifier.fillMaxWidth().height(180.dp)
-            .background(SURFACE, RoundedCornerShape(3.dp))
-            .border(1.dp, BORDER, RoundedCornerShape(3.dp))
-            .padding(8.dp)
-    ) {
-        val w = size.width
-        val h = size.height
-        val n = buckets.size
-        if (n == 0) return@Canvas
-
-        // Horizontal grid: -20 / -55 (alert) / -75 / -100 dBFS reference lines.
-        // Map matches the bar mapping below: -110..-20 dBFS → 0..1 of height.
-        fun yForDb(db: Float): Float {
-            val v = ((db + 110f) / 90f).coerceIn(0f, 1f)
-            return h - v * h
-        }
-        drawLine(BORDER, Offset(0f, yForDb(-100f)), Offset(w, yForDb(-100f)), 1f)
-        drawLine(BORDER, Offset(0f, yForDb(-75f)),  Offset(w, yForDb(-75f)),  1f)
-        drawLine(
-            AMBER.copy(alpha = 0.35f),
-            Offset(0f, yForDb(-55f)), Offset(w, yForDb(-55f)), 1f,
-        )
-
-        val cw = w / n
-        val gap = 2f
-        for (i in 0 until n) {
-            val db = buckets[i]
-            // Wider range so the typical ultrasonic noise floor (-95..-110)
-            // still produces a visible bar and beacons at -55..-30 fill most
-            // of the canvas.
-            val v = ((db + 110f) / 90f).coerceIn(0f, 1f)
-            // Always at least 1px so the spectrum is visible at idle.
-            val barH = (v * h).coerceAtLeast(1f)
-            val color = when {
-                db > -55f -> AMBER
-                db > -75f -> PHOSPHOR
-                db > -95f -> PHOSPHOR.copy(alpha = if (running) 0.55f else 0.22f)
-                else      -> PHOSPHOR.copy(alpha = if (running) 0.30f else 0.12f)
-            }
-            drawRect(
-                color = color,
-                topLeft = Offset(i * cw + gap / 2f, h - barH),
-                size = Size(cw - gap, barH),
-            )
-        }
-    }
-}
-
 /* ───────────────────────── NET (per-app usage ledger) ───────────────────────── */
 
 @Composable
@@ -994,7 +832,7 @@ private fun ScanScreen() {
         }
         if (hasCamPerm) {
             Spacer(Modifier.height(16.dp))
-            SectionHeader("front cam preview")
+            SectionHeader("rear cam preview")
             Spacer(Modifier.height(8.dp))
             Box(
                 Modifier.fillMaxWidth().height(280.dp)
@@ -1029,11 +867,13 @@ private fun ScanScreen() {
         }
         Spacer(Modifier.height(20.dp))
         Disclaimer(
-            "SCAN streams the front camera through on-device ML Kit face detection. " +
-                "Frames never leave the phone — no recording, no upload. Alert fires " +
-                "when 2+ faces are visible for >2s. Won't catch hidden mirrors, " +
-                "magnifiers, or long-lens cameras across a room. Will false-positive " +
-                "when you're showing your screen to someone on purpose."
+            "SCAN uses the REAR camera so it watches the room behind you — prop " +
+                "the phone screen-down or against something with the back lens " +
+                "facing the space you want monitored. On-device ML Kit counts " +
+                "faces per frame; frames never leave the phone — no recording, " +
+                "no upload. Alert fires when 2+ faces persist for >2 s. Won't " +
+                "catch hidden mirrors, magnifiers, or long-lens cameras across a " +
+                "room."
         )
         Spacer(Modifier.height(20.dp))
     }
@@ -1090,16 +930,14 @@ private fun AboutScreen() {
                 "speech band of nearby microphones. Useful for in-person privacy in " +
                 "a small bubble.",
             "",
-            "03 ECHO — live FFT of the 18–22 kHz band where SilverPush-style " +
-                "ultrasonic ad/tracking beacons live. Surfaces what your phone hears " +
-                "that you can't.",
+            "03 NET — per-app traffic analyzer. Reads the OS's NetworkStatsManager " +
+                "to show bytes-out + bytes-in for every installed app over the last " +
+                "24 hours. Catches apps quietly phoning home in the background. " +
+                "Byte counts only — never destinations or content.",
             "",
-            "04 NET — per-app data-usage ledger. Catches apps quietly uploading " +
-                "in the background. Bytes only — never destinations or content.",
-            "",
-            "05 SCAN — front-cam shoulder-surfer detection. On-device ML Kit " +
-                "counts faces visible to the front lens; alerts when someone joins " +
-                "yours. No frames leave the phone.",
+            "04 SCAN — rear-cam shoulder-surfer detection. Prop the phone with " +
+                "its back lens facing the room you want watched. On-device ML Kit " +
+                "counts faces and alerts when 2+ persist. No frames leave the phone.",
         )
 
         Spacer(Modifier.height(20.dp))
@@ -1117,10 +955,14 @@ private fun AboutScreen() {
         SectionHeader("changelog")
         Spacer(Modifier.height(8.dp))
         BodyBlock(
-            "v0.4.1 — Added three sensors: ECHO (ultrasonic-beacon spectrum monitor, " +
-                "18–22 kHz FFT), NET (per-app data-usage ledger, requires Usage Access), " +
-                "SCAN (front-cam shoulder-surfer detection via on-device ML Kit face " +
-                "detection — frames never leave the phone).",
+            "v0.4.2 — Removed ECHO (ultrasonic monitor) — phone-mic ultrasonic " +
+                "sensitivity was too device-dependent to be a useful sensor. Switched " +
+                "SCAN from front-cam to REAR camera so it actually watches the room " +
+                "behind you instead of mirroring your face.",
+            "",
+            "v0.4.1 — Added NET (per-app traffic analyzer via NetworkStatsManager) " +
+                "and SCAN (on-device ML Kit face detection — frames never leave the " +
+                "phone).",
             "",
             "v0.3.0 — Removed the on-device DNS sinkhole VPN entirely. It was " +
                 "fragile and occasionally broke users' internet (carrier middleboxes, " +
@@ -1137,7 +979,7 @@ private fun AboutScreen() {
         BodyBlock(
             "source:   github.com/1800bobrossdotcom-byte/bastion-mobile",
             "issues:   github.com/1800bobrossdotcom-byte/bastion-mobile/issues",
-            "version:  0.4.0 (build 12)",
+            "version:  0.4.2 (build 13)",
         )
         Spacer(Modifier.height(24.dp))
     }

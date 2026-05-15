@@ -17,16 +17,18 @@ import com.google.mlkit.vision.face.FaceDetectorOptions
 import java.util.concurrent.Executors
 
 /**
- * Front-cam shoulder-surfer detector ("Shadow Scan").
+ * Rear-cam shoulder-surfer detector ("Shadow Scan").
  *
- * Streams the front camera through ML Kit's on-device face detector. We never
- * record, never save a frame, never upload — we only count faces per frame.
- * If 2+ faces persist for >2 s, fire the SHOULDER_SURFER alert.
+ * Streams the REAR camera through ML Kit's on-device face detector. Designed
+ * to be propped with the back lens facing the room behind the user — if
+ * someone walks up behind you, ML Kit sees them. We never record, never save
+ * a frame, never upload — we only count faces per frame. If 2+ faces persist
+ * for >2 s, fire the SHOULDER_SURFER alert.
  *
- * Honesty scope: detects faces visible from the front lens at typical phone
- * holding distance. Won't see someone using a magnifier, a long-lens camera,
- * or a hidden mirror. Will false-positive when you're showing your phone to
- * a friend on purpose — that's the trade.
+ * Honesty scope: detects faces visible from the rear lens. Won't see someone
+ * using a magnifier, a long-lens camera, or a hidden mirror. Won't catch
+ * anyone outside the lens's field of view. Will false-positive when the
+ * room legitimately has 2+ people in it.
  */
 class ShadowScanner {
 
@@ -71,7 +73,7 @@ class ShadowScanner {
                     ia.setAnalyzer(executor) { proxy -> analyze(proxy) }
                 }
             val selector = CameraSelector.Builder()
-                .requireLensFacing(CameraSelector.LENS_FACING_FRONT)
+                .requireLensFacing(CameraSelector.LENS_FACING_BACK)
                 .build()
 
             try {
