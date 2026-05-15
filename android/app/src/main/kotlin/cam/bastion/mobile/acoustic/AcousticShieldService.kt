@@ -3,15 +3,19 @@ package cam.bastion.mobile.acoustic
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.media.*
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import androidx.core.app.ServiceCompat
 import cam.bastion.mobile.MainActivity
 import cam.bastion.mobile.R
 import kotlinx.coroutines.*
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.random.Random
 
 /**
@@ -48,6 +52,11 @@ class AcousticShieldService : Service() {
         @Volatile var currentVolume: Float = 0.6f; private set
         @Volatile var currentIntensity: Float = 0.7f; private set
         @Volatile var currentTarget: Int = 1000; private set
+        /** RMS amplitude of the most recent rendered chunk, 0..1. Read by UI for live meter. */
+        @Volatile var outputLevel: Float = 0f; private set
+        internal fun publishLevel(v: Float) { outputLevel = v }
+
+        const val ACTION_UPDATE = "cam.bastion.mobile.acoustic.UPDATE"
 
         fun start(ctx: Context, mode: Mode, volume: Float, intensity: Float, target: Int) {
             val i = Intent(ctx, AcousticShieldService::class.java)
@@ -59,8 +68,16 @@ class AcousticShieldService : Service() {
             else ctx.startService(i)
         }
 
+        /** Update parameters live without restarting the audio stream. Use during slider drag. */
+        fun updateParams(volume: Float, intensity: Float, target: Int) {
+            currentVolume = volume
+            currentIntensity = intensity
+            currentTarget = target
+        }
+
         fun stop(ctx: Context) {
             ctx.stopService(Intent(ctx, AcousticShieldService::class.java))
+            outputLevel = 0f
         }
     }
 
@@ -78,11 +95,29 @@ class AcousticShieldService : Service() {
         currentIntensity = intent?.getFloatExtra(EXTRA_INTENSITY, 0.7f) ?: 0.7f
         currentTarget = intent?.getIntExtra(EXTRA_TARGET, 1000) ?: 1000
 
-        startForeground(NOTIF_ID, notification(mode))
+        // Pick FGS type per mode. PHASE needs mic; others are pure playback.
+        // Calling startForeground with the right type avoids SecurityException on API 34+.
+        val fgsType = if (mode == Mode.PHASE) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        } else {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        }
+        try {
+            ServiceCompat.startForeground(this, NOTIF_ID, notification(mode), fgsType)
+        } catch (t: Throwable) {
+            Log.e(TAG, "startForeground failed: ${t.message}", t)
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         if (mode == Mode.OFF) {
             stopSelf()
             return START_NOT_STICKY
+        }
+        // If already running this mode, just keep going — params are already updated above.
+        if (mode == currentMode && job?.isActive == true) {
+            return START_STICKY
         }
         currentMode = mode
         runMode(mode)
@@ -137,15 +172,14 @@ class AcousticShieldService : Service() {
     /** Sawtooth swept ±1.25 kHz around 2.75 kHz by 2 Hz triangle LFO, bandpassed. */
     private suspend fun renderSweep(t: AudioTrack) = withContext(Dispatchers.IO) {
         val frame = ShortBuffer(2048)
-        val gain = 0.3f * currentIntensity * currentVolume
         var sawPhase = 0.0
         var lfoPhase = 0.0
         val lfoHz = 2.0
         val sweepDepth = 1250.0
         val centre = 2750.0
         val bp = Biquad.bandpass(centre, q = 2.0)
-        var n = 0L
         while (isActive) {
+            val gain = 0.3f * currentIntensity * currentVolume
             for (i in 0 until frame.size) {
                 val lfo = triangle(lfoPhase) // -1..1
                 lfoPhase += lfoHz / SAMPLE_RATE; if (lfoPhase >= 1) lfoPhase -= 1
@@ -156,36 +190,42 @@ class AcousticShieldService : Service() {
                 frame.set(i, filtered)
             }
             t.write(frame.data, 0, frame.size, AudioTrack.WRITE_BLOCKING)
-            n += frame.size
+            publishLevel(rms(frame.data))
         }
     }
 
     /** Bandpass-filtered white noise centred on 2 kHz, Q=0.5. */
     private suspend fun renderBroadband(t: AudioTrack) = withContext(Dispatchers.IO) {
         val frame = ShortBuffer(2048)
-        val gain = 0.4f * currentIntensity * currentVolume
         val bp = Biquad.bandpass(2000.0, q = 0.5)
         val rng = Random.Default
         while (isActive) {
+            val gain = 0.4f * currentIntensity * currentVolume
             for (i in 0 until frame.size) {
                 val s = (rng.nextFloat() * 2f - 1f).toDouble()
                 frame.set(i, (bp.process(s) * gain).toFloat())
             }
             t.write(frame.data, 0, frame.size, AudioTrack.WRITE_BLOCKING)
+            publishLevel(rms(frame.data))
         }
     }
 
     /** Stacked harmonics 2..5 of targetFreq, slightly detuned per harmonic. */
     private suspend fun renderCounter(t: AudioTrack) = withContext(Dispatchers.IO) {
         val frame = ShortBuffer(2048)
-        val base = currentTarget.toDouble().coerceIn(50.0, 6000.0)
-        val gain = 0.25f * currentIntensity * currentVolume
         val phases = DoubleArray(4) { 0.0 }
-        val freqs = DoubleArray(4) { h ->
-            val H = h + 2
-            base * H + 3.7 * (H - 1)
-        }
+        var lastBase = -1.0
+        var freqs = DoubleArray(4)
         while (isActive) {
+            val base = currentTarget.toDouble().coerceIn(50.0, 6000.0)
+            if (base != lastBase) {
+                for (h in 0..3) {
+                    val H = h + 2
+                    freqs[h] = base * H + 3.7 * (H - 1)
+                }
+                lastBase = base
+            }
+            val gain = 0.25f * currentIntensity * currentVolume
             for (i in 0 until frame.size) {
                 var s = 0f
                 for (h in 0..3) {
@@ -196,6 +236,7 @@ class AcousticShieldService : Service() {
                 frame.set(i, s)
             }
             t.write(frame.data, 0, frame.size, AudioTrack.WRITE_BLOCKING)
+            publishLevel(rms(frame.data))
         }
     }
 
@@ -217,7 +258,6 @@ class AcousticShieldService : Service() {
         }
         record = rec
         rec.startRecording()
-        val gain = currentVolume
         val bufSize = 1024
         val read = FloatArray(bufSize)
         val out = FloatArray(bufSize)
@@ -228,6 +268,7 @@ class AcousticShieldService : Service() {
         while (isActive) {
             val n = rec.read(read, 0, bufSize, AudioRecord.READ_BLOCKING)
             if (n <= 0) continue
+            val gain = currentVolume
             for (i in 0 until n) {
                 val delayed = ring[ringIdx]
                 ring[ringIdx] = read[i]
@@ -235,6 +276,7 @@ class AcousticShieldService : Service() {
                 out[i] = -delayed * gain
             }
             t.write(out, 0, n, AudioTrack.WRITE_BLOCKING)
+            publishLevel(rms(out, n))
         }
     }
 
@@ -252,6 +294,14 @@ class AcousticShieldService : Service() {
     private fun triangle(phase: Double): Double {
         // -1..1 triangle from 0..1 phase
         return if (phase < 0.5) -1.0 + 4.0 * phase else 3.0 - 4.0 * phase
+    }
+
+    private fun rms(buf: FloatArray, n: Int = buf.size): Float {
+        if (n <= 0) return 0f
+        var sum = 0.0
+        var i = 0
+        while (i < n) { val v = buf[i]; sum += v * v; i++ }
+        return sqrt(sum / n).toFloat().coerceIn(0f, 1f)
     }
 
     private fun notification(mode: Mode): Notification {
@@ -276,6 +326,7 @@ class AcousticShieldService : Service() {
 
     override fun onDestroy() {
         currentMode = Mode.OFF
+        outputLevel = 0f
         job?.cancel()
         scope.cancel()
         teardownAudio()
