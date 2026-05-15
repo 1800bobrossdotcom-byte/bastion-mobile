@@ -4,4 +4,6 @@
     <string name="vpn_notification_title">BASTION sensor active</string>
     <string name="vpn_notification_body">Filtering DNS against malware + phishing blocklist.</string>
     <string name="vpn_channel_name">BASTION sensor</string>
+    <string name="acoustic_channel_name">BASTION acoustic shield</string>
+    <string name="acoustic_notification_title">BASTION acoustic shield active</string>
 </resources>

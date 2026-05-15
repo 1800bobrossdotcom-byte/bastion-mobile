@@ -11,7 +11,10 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import cam.bastion.mobile.MainActivity
 import cam.bastion.mobile.R
+import cam.bastion.mobile.audit.AuditDb
+import cam.bastion.mobile.audit.AuditEvent
 import cam.bastion.mobile.blocklist.BlocklistRepo
+import cam.bastion.mobile.settings.Settings
 import kotlinx.coroutines.*
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -41,7 +44,6 @@ class BastionVpnService : VpnService() {
         private const val TAG = "BastionVPN"
         private const val NOTIF_ID = 1001
         private const val CHANNEL_ID = "bastion-sensor"
-        private const val UPSTREAM_DNS = "1.1.1.1"
     }
 
     private var tun: ParcelFileDescriptor? = null
@@ -54,11 +56,12 @@ class BastionVpnService : VpnService() {
     }
 
     private fun startVpn() {
+        val upstream = Settings.resolver(applicationContext).ip
         tun = Builder()
             .setSession("BASTION")
             .addAddress("10.42.0.2", 24)
             .addRoute("0.0.0.0", 0)
-            .addDnsServer(UPSTREAM_DNS)
+            .addDnsServer(upstream)
             .setMtu(1500)
             .establish() ?: run {
                 Log.e(TAG, "VpnService.Builder.establish() returned null")
@@ -68,7 +71,7 @@ class BastionVpnService : VpnService() {
 
         scope.launch {
             BlocklistRepo.refreshIfStale(applicationContext)
-            runDnsLoop(tun!!)
+            runDnsLoop(tun!!, upstream)
         }
     }
 
@@ -78,11 +81,12 @@ class BastionVpnService : VpnService() {
      *
      * TODO(0.2): full IPv6 + DoH detection.
      */
-    private suspend fun runDnsLoop(tun: ParcelFileDescriptor) = withContext(Dispatchers.IO) {
+    private suspend fun runDnsLoop(tun: ParcelFileDescriptor, upstreamIp: String) = withContext(Dispatchers.IO) {
         val input = FileInputStream(tun.fileDescriptor)
         val output = FileOutputStream(tun.fileDescriptor)
         val buf = ByteArray(32_767)
         val upstream = DatagramSocket().also { protect(it) }
+        val auditDao = AuditDb.get(applicationContext).dao()
 
         while (isActive) {
             val n = try { input.read(buf) } catch (_: Throwable) { -1 }
@@ -104,6 +108,10 @@ class BastionVpnService : VpnService() {
             val hostname = parseDnsQuestion(dnsPayload) ?: continue
             if (BlocklistRepo.isBlocked(hostname)) {
                 Log.i(TAG, "BLOCKED $hostname")
+                runCatching {
+                    auditDao.insert(AuditEvent(ts = System.currentTimeMillis(),
+                        host = hostname, action = "BLOCKED"))
+                }
                 // For 0.1: drop silently (client times out, fast enough).
                 // 0.2: synthesize NXDOMAIN response and write back.
                 continue
@@ -112,7 +120,7 @@ class BastionVpnService : VpnService() {
             // Forward to upstream resolver
             try {
                 val pkt = DatagramPacket(dnsPayload, dnsPayload.size,
-                    InetAddress.getByName(UPSTREAM_DNS), 53)
+                    InetAddress.getByName(upstreamIp), 53)
                 upstream.send(pkt)
 
                 val resp = ByteArray(4096)

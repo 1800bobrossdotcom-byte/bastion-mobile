@@ -2,6 +2,7 @@ package cam.bastion.mobile.blocklist
 
 import android.content.Context
 import android.util.Log
+import cam.bastion.mobile.settings.Settings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -20,6 +21,8 @@ object BlocklistRepo {
     private const val MAX_AGE_MS = 12L * 60 * 60 * 1000
 
     @Volatile private var hosts: Set<String> = emptySet()
+    val hostCount: Int get() = hosts.size
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
@@ -41,20 +44,36 @@ object BlocklistRepo {
     suspend fun refreshIfStale(ctx: Context) = withContext(Dispatchers.IO) {
         val cache = File(ctx.filesDir, CACHE_FILE)
         val fresh = cache.exists() && System.currentTimeMillis() - cache.lastModified() < MAX_AGE_MS
-        if (!fresh) {
-            try {
-                val resp = client.newCall(Request.Builder().url(URL).build()).execute()
-                resp.use {
-                    if (it.isSuccessful) {
-                        val body = it.body?.string().orEmpty()
-                        if (body.isNotBlank()) cache.writeText(body)
+        if (!fresh) doFetch(ctx, cache)
+        if (cache.exists()) load(cache)
+    }
+
+    /** Returns true if a successful fetch happened. */
+    suspend fun forceRefresh(ctx: Context): Boolean = withContext(Dispatchers.IO) {
+        val cache = File(ctx.filesDir, CACHE_FILE)
+        val ok = doFetch(ctx, cache)
+        if (cache.exists()) load(cache)
+        ok
+    }
+
+    private fun doFetch(ctx: Context, cache: File): Boolean {
+        return try {
+            val resp = client.newCall(Request.Builder().url(URL).build()).execute()
+            resp.use {
+                if (it.isSuccessful) {
+                    val body = it.body?.string().orEmpty()
+                    if (body.isNotBlank()) {
+                        cache.writeText(body)
+                        Settings.setLastRefresh(ctx, System.currentTimeMillis())
+                        return@use true
                     }
                 }
-            } catch (t: Throwable) {
-                Log.w("BlocklistRepo", "fetch failed: ${t.message}")
+                false
             }
+        } catch (t: Throwable) {
+            Log.w("BlocklistRepo", "fetch failed: ${t.message}")
+            false
         }
-        if (cache.exists()) load(cache)
     }
 
     private fun load(file: File) {
