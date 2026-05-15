@@ -16,6 +16,8 @@ import cam.bastion.mobile.audit.AuditEvent
 import cam.bastion.mobile.blocklist.BlocklistRepo
 import cam.bastion.mobile.settings.Settings
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.DatagramPacket
@@ -117,17 +119,22 @@ class BastionVpnService : VpnService() {
      * Reads packets from the tun, parses DNS, sinkholes blocked hostnames,
      * forwards everything else.
      *
-     * TODO(0.2): full IPv6 + DoH detection.
+     * Concurrency model: the read loop dispatches each query to its OWN
+     * coroutine + its OWN protect()'d DatagramSocket. A single shared socket
+     * causes responses to land out of order — the wrong response then gets
+     * wrapped with the wrong source IP/port and the querying app's resolver
+     * discards it on transaction-ID mismatch, eventually killing all DNS
+     * resolution and giving the user the impression that internet is broken.
      */
     private suspend fun runDnsLoop(tun: ParcelFileDescriptor, upstreamIp: String) = withContext(Dispatchers.IO) {
         val input = FileInputStream(tun.fileDescriptor)
         val output = FileOutputStream(tun.fileDescriptor)
+        val writeMutex = Mutex()
         val buf = ByteArray(32_767)
-        val upstream = DatagramSocket().also { protect(it) }
         val auditDao = AuditDb.get(applicationContext).dao()
 
         while (isActive) {
-            val n = try { input.read(buf) } catch (_: Throwable) { -1 }
+            val n = try { input.read(buf) } catch (_: Throwable) { break }
             if (n <= 0) continue
 
             // Minimal IPv4 + UDP detection. v=4, proto=17 (UDP), dst port 53.
@@ -141,7 +148,12 @@ class BastionVpnService : VpnService() {
 
             val udpHeaderEnd = ihl + 8
             if (n <= udpHeaderEnd + 12) continue
+
+            // Snapshot per-packet fields BEFORE buf is reused on the next read.
             val dnsPayload = buf.copyOfRange(udpHeaderEnd, n)
+            val originalSrcAddr = buf.copyOfRange(12, 16)  // app
+            val originalDstAddr = buf.copyOfRange(16, 20)  // upstream resolver
+            val originalSrcPort = ((buf[ihl].toInt() and 0xFF) shl 8) or (buf[ihl + 1].toInt() and 0xFF)
 
             val hostname = parseDnsQuestion(dnsPayload) ?: continue
             if (BlocklistRepo.isBlocked(hostname)) {
@@ -150,35 +162,63 @@ class BastionVpnService : VpnService() {
                     auditDao.insert(AuditEvent(ts = System.currentTimeMillis(),
                         host = hostname, action = "BLOCKED"))
                 }
-                // For 0.1: drop silently (client times out, fast enough).
-                // 0.2: synthesize NXDOMAIN response and write back.
+                // Synthesize NXDOMAIN so the app fails fast instead of waiting
+                // out its DNS timeout (which makes the phone feel "broken").
+                val nx = synthesizeNxDomain(dnsPayload)
+                val wrapped = wrapIpv4Udp(
+                    srcAddr = originalDstAddr, dstAddr = originalSrcAddr,
+                    srcPort = 53, dstPort = originalSrcPort, payload = nx,
+                )
+                runCatching { writeMutex.withLock { output.write(wrapped) } }
                 continue
             }
 
-            // Forward to upstream resolver
-            try {
-                val pkt = DatagramPacket(dnsPayload, dnsPayload.size,
-                    InetAddress.getByName(upstreamIp), 53)
-                upstream.send(pkt)
-
-                val resp = ByteArray(4096)
-                val respPkt = DatagramPacket(resp, resp.size)
-                upstream.soTimeout = 3000
-                upstream.receive(respPkt)
-
-                // Build IPv4+UDP wrapper to write back to tun
-                val wrapped = wrapIpv4Udp(
-                    srcAddr = buf.copyOfRange(16, 20), // original dst becomes src
-                    dstAddr = buf.copyOfRange(12, 16), // original src becomes dst
-                    srcPort = 53,
-                    dstPort = ((buf[ihl].toInt() and 0xFF) shl 8) or (buf[ihl + 1].toInt() and 0xFF),
-                    payload = resp.copyOfRange(0, respPkt.length)
-                )
-                output.write(wrapped)
-            } catch (t: Throwable) {
-                Log.w(TAG, "upstream DNS error: ${t.message}")
+            // Forward to upstream resolver — own socket per query, fire-and-forget.
+            scope.launch {
+                val sock = try {
+                    DatagramSocket().also { protect(it); it.soTimeout = 5000 }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "socket alloc failed: ${t.message}"); return@launch
+                }
+                try {
+                    sock.send(DatagramPacket(dnsPayload, dnsPayload.size,
+                        InetAddress.getByName(upstreamIp), 53))
+                    val resp = ByteArray(4096)
+                    val respPkt = DatagramPacket(resp, resp.size)
+                    sock.receive(respPkt)
+                    val wrapped = wrapIpv4Udp(
+                        srcAddr = originalDstAddr, dstAddr = originalSrcAddr,
+                        srcPort = 53, dstPort = originalSrcPort,
+                        payload = resp.copyOfRange(0, respPkt.length),
+                    )
+                    writeMutex.withLock { output.write(wrapped) }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "upstream DNS error for $hostname: ${t.message}")
+                } finally {
+                    runCatching { sock.close() }
+                }
             }
         }
+    }
+
+    /**
+     * Build a minimal NXDOMAIN response from the original query.
+     * Sets QR=1, RA=1, RCODE=3 (NXDOMAIN). Answer/authority/additional counts
+     * stay at the query's defaults (0). The question section is preserved
+     * verbatim so the app's resolver matches transaction-ID + question.
+     */
+    private fun synthesizeNxDomain(query: ByteArray): ByteArray {
+        val resp = query.copyOf()
+        if (resp.size < 12) return resp
+        // Byte 2: QR(1) Opcode(0) AA(0) TC(0) RD(preserve)
+        resp[2] = ((resp[2].toInt() and 0x01) or 0x80).toByte()
+        // Byte 3: RA(1) Z(0) RCODE(3 = NXDOMAIN)
+        resp[3] = (0x80 or 0x03).toByte()
+        // Zero answer/authority/additional counts.
+        resp[6] = 0; resp[7] = 0
+        resp[8] = 0; resp[9] = 0
+        resp[10] = 0; resp[11] = 0
+        return resp
     }
 
     private fun parseDnsQuestion(dns: ByteArray): String? {

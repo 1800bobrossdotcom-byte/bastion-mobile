@@ -104,7 +104,7 @@ private fun TopBar(tab: Tab) {
         Column(Modifier.weight(1f)) {
             Text("BASTION", color = PHOSPHOR, fontFamily = MONO, fontSize = 22.sp,
                 fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
-            Text("v0.2.3 :: ${tab.short} ${tab.long}", color = INK_DIM,
+            Text("v0.2.4 :: ${tab.short} ${tab.long}", color = INK_DIM,
                 fontFamily = MONO, fontSize = 10.sp, letterSpacing = 2.sp)
         }
         Pulse()
@@ -254,9 +254,9 @@ private fun SensorScreen() {
         }
         Spacer(Modifier.height(28.dp))
         Disclaimer(
-            "BASTION watches DNS only — it routes DNS lookups through itself " +
-                "to filter URLhaus + OpenPhish. All other traffic uses your normal " +
-                "network. It cannot stop spyware or detect Pegasus."
+            "BASTION runs silently in the background filtering DNS lookups " +
+                "against URLhaus + OpenPhish. All other traffic uses your normal " +
+                "network — leave it on. It cannot stop spyware or detect Pegasus."
         )
     }
 }
