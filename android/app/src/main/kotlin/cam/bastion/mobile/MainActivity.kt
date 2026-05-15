@@ -16,6 +16,8 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -31,13 +33,19 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import cam.bastion.mobile.acoustic.AcousticShieldService
+import cam.bastion.mobile.echo.UltrasonicMonitor
+import cam.bastion.mobile.net.NetworkUsage
+import cam.bastion.mobile.scan.ShadowScanner
 import cam.bastion.mobile.settings.Settings
 import cam.bastion.mobile.theme.AMBER
 import cam.bastion.mobile.theme.BORDER
@@ -59,7 +67,10 @@ class MainActivity : ComponentActivity() {
 private enum class Tab(val short: String, val long: String) {
     DNS("01", "dns"),
     SHIELD("02", "shield"),
-    ABOUT("03", "about"),
+    ECHO("03", "echo"),
+    NET("04", "net"),
+    SCAN("05", "scan"),
+    ABOUT("06", "about"),
 }
 
 @Composable
@@ -73,6 +84,9 @@ fun BastionApp() {
                 when (tab) {
                     Tab.DNS -> DnsScreen()
                     Tab.SHIELD -> ShieldScreen()
+                    Tab.ECHO -> EchoScreen()
+                    Tab.NET -> NetScreen()
+                    Tab.SCAN -> ScanScreen()
                     Tab.ABOUT -> AboutScreen()
                 }
             }
@@ -92,7 +106,7 @@ private fun TopBar(tab: Tab) {
         Column(Modifier.weight(1f)) {
             Text("BASTION", color = PHOSPHOR, fontFamily = MONO, fontSize = 22.sp,
                 fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
-            Text("v0.3.0 :: ${tab.short} ${tab.long}", color = INK_DIM,
+            Text("v0.4.0 :: ${tab.short} ${tab.long}", color = INK_DIM,
                 fontFamily = MONO, fontSize = 10.sp, letterSpacing = 2.sp)
         }
         Pulse()
@@ -180,10 +194,10 @@ private fun BottomTabs(active: Tab, onSelect: (Tab) -> Unit) {
                 verticalArrangement = Arrangement.Center,
             ) {
                 Text(t.short, color = if (on) PHOSPHOR else INK_DIM,
-                    fontFamily = MONO, fontSize = 9.sp, letterSpacing = 1.sp)
+                    fontFamily = MONO, fontSize = 8.sp, letterSpacing = 0.5.sp)
                 Spacer(Modifier.height(2.dp))
                 Text(t.long, color = if (on) PHOSPHOR else INK,
-                    fontFamily = MONO, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    fontFamily = MONO, fontSize = 11.sp, fontWeight = FontWeight.Bold)
             }
         }
     }
@@ -630,6 +644,411 @@ private fun BigSliderInt(label: String, valueLabel: String, value: Int, range: I
     }
 }
 
+/* ───────────────────────── ECHO (ultrasonic monitor) ───────────────────────── */
+
+private val echoMonitor = UltrasonicMonitor()
+
+@Composable
+private fun EchoScreen() {
+    val ctx = LocalContext.current
+    var hasMicPerm by remember { mutableStateOf(
+        ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO)
+            == PackageManager.PERMISSION_GRANTED
+    ) }
+    var running by remember { mutableStateOf(echoMonitor.running) }
+    var frame by remember { mutableStateOf(echoMonitor.latest) }
+    var sustainedMs by remember { mutableLongStateOf(0L) }
+
+    val micPerm = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasMicPerm = granted
+        if (granted) running = echoMonitor.start()
+    }
+
+    LaunchedEffect(running) {
+        var lastAlertTs = 0L
+        while (running) {
+            frame = echoMonitor.latest
+            // Sustained-narrowband heuristic: peak louder than -55 dBFS for >1s.
+            val now = System.currentTimeMillis()
+            if (frame.peakDb > -55f) {
+                if (lastAlertTs == 0L) lastAlertTs = now
+                sustainedMs = now - lastAlertTs
+            } else {
+                lastAlertTs = 0L
+                sustainedMs = 0L
+            }
+            delay(80)
+        }
+    }
+    DisposableEffect(Unit) { onDispose { echoMonitor.stop(); running = false } }
+
+    val beaconAlert = sustainedMs > 1000L
+
+    Column(
+        Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(top = 18.dp)
+            .verticalScroll(rememberScrollState())
+    ) {
+        EchoStatusPanel(running, frame, beaconAlert)
+        Spacer(Modifier.height(14.dp))
+        ActionButton(if (running) "STOP MONITOR" else "START MONITOR") {
+            if (running) {
+                echoMonitor.stop(); running = false; sustainedMs = 0L
+            } else if (!hasMicPerm) {
+                micPerm.launch(Manifest.permission.RECORD_AUDIO)
+            } else {
+                running = echoMonitor.start()
+            }
+        }
+        Spacer(Modifier.height(20.dp))
+        SectionHeader("18 - 22 khz spectrum")
+        Spacer(Modifier.height(8.dp))
+        SpectrumCanvas(frame.buckets, running)
+        Spacer(Modifier.height(20.dp))
+        Disclaimer(
+            "ECHO surfaces energy in the ultrasonic band where SilverPush-style " +
+                "cross-device tracking beacons live. We don't claim every spike is " +
+                "a beacon — wind, fingernails on glass, and CRT flyback can chirp " +
+                "here too. Sustained narrowband peaks > -55 dBFS for >1 s are the " +
+                "suspicious pattern. Phone mics roll off above ~22 kHz."
+        )
+        Spacer(Modifier.height(20.dp))
+    }
+}
+
+@Composable
+private fun EchoStatusPanel(running: Boolean, frame: UltrasonicMonitor.Frame, alert: Boolean) {
+    val color = when {
+        alert -> AMBER
+        running -> PHOSPHOR
+        else -> INK_DIM
+    }
+    Column(
+        Modifier.fillMaxWidth()
+            .background(SURFACE, RoundedCornerShape(4.dp))
+            .border(1.dp, BORDER, RoundedCornerShape(4.dp))
+            .padding(16.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("STATUS", color = INK_DIM, fontFamily = MONO, fontSize = 10.sp,
+                letterSpacing = 2.sp, modifier = Modifier.weight(1f))
+            if (running) Pulse()
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            when {
+                alert -> "BEACON SUSPECTED"
+                running -> "LISTENING"
+                else -> "IDLE"
+            },
+            color = color, fontFamily = MONO, fontSize = 22.sp,
+            fontWeight = FontWeight.Bold, letterSpacing = 3.sp,
+        )
+        Spacer(Modifier.height(12.dp))
+        KvLine("peak freq", "%.0f Hz".format(frame.peakHz))
+        KvLine("peak level", "%.1f dBFS".format(frame.peakDb))
+        KvLine("band", "18 000 - 22 000 Hz")
+    }
+}
+
+@Composable
+private fun SpectrumCanvas(buckets: FloatArray, running: Boolean) {
+    Canvas(
+        Modifier.fillMaxWidth().height(180.dp)
+            .background(SURFACE, RoundedCornerShape(3.dp))
+            .border(1.dp, BORDER, RoundedCornerShape(3.dp))
+            .padding(8.dp)
+    ) {
+        val w = size.width
+        val h = size.height
+        val n = buckets.size
+        if (n == 0) return@Canvas
+        val cw = w / n
+        val gap = 2f
+        for (i in 0 until n) {
+            val db = buckets[i]
+            // Map -90..0 dBFS → 0..1
+            val v = ((db + 90f) / 90f).coerceIn(0f, 1f)
+            val barH = v * h
+            val color = when {
+                db > -55f -> AMBER
+                db > -75f -> PHOSPHOR
+                else -> PHOSPHOR.copy(alpha = if (running) 0.45f else 0.18f)
+            }
+            drawRect(
+                color = color,
+                topLeft = Offset(i * cw + gap / 2f, h - barH),
+                size = Size(cw - gap, barH),
+            )
+        }
+    }
+}
+
+/* ───────────────────────── NET (per-app usage ledger) ───────────────────────── */
+
+@Composable
+private fun NetScreen() {
+    val ctx = LocalContext.current
+    var permitted by remember { mutableStateOf(NetworkUsage.hasUsageStatsPermission(ctx)) }
+    var rows by remember { mutableStateOf<List<NetworkUsage.Row>>(emptyList()) }
+    var loading by remember { mutableStateOf(false) }
+    var includeSystem by rememberSaveable { mutableStateOf(false) }
+    val activeNet = remember { NetworkUsage.activeNetworkLabel(ctx) }
+
+    fun refresh() {
+        loading = true
+        rows = NetworkUsage.snapshot(ctx)
+        loading = false
+    }
+
+    LaunchedEffect(Unit) {
+        // Re-poll permission every second so returning from settings updates UI.
+        while (true) {
+            val p = NetworkUsage.hasUsageStatsPermission(ctx)
+            if (p && !permitted) { permitted = true; refresh() }
+            else if (!p && permitted) { permitted = false; rows = emptyList() }
+            delay(1000)
+        }
+    }
+    LaunchedEffect(permitted) { if (permitted) refresh() }
+
+    if (!permitted) {
+        Column(
+            Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(top = 18.dp)
+                .verticalScroll(rememberScrollState())
+        ) {
+            SectionHeader("usage access required")
+            Spacer(Modifier.height(8.dp))
+            BodyBlock(
+                "NET reads Android's per-app data-usage ledger. The OS gates this",
+                "behind the special PACKAGE_USAGE_STATS permission, granted manually:",
+                "",
+                "1. Tap [OPEN USAGE ACCESS SETTINGS] below.",
+                "2. Find BASTION in the list. Toggle it on.",
+                "3. Press back — this screen will populate.",
+            )
+            Spacer(Modifier.height(14.dp))
+            ActionButton("OPEN USAGE ACCESS SETTINGS") {
+                NetworkUsage.openUsageAccessSettings(ctx)
+            }
+            Spacer(Modifier.height(20.dp))
+            Disclaimer(
+                "NET shows bytes-out and bytes-in per app over the last 24h. We " +
+                    "never see destinations, hostnames, or content — that's billing-" +
+                    "grade aggregate, not packet capture. Useful for spotting apps " +
+                    "that quietly upload while you're asleep."
+            )
+        }
+        return
+    }
+
+    val total = rows.sumOf { it.total }
+    val displayed = if (includeSystem) rows else rows.filter { !it.isSystem }
+
+    Column(Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(top = 18.dp)) {
+        Column(
+            Modifier.fillMaxWidth()
+                .background(SURFACE, RoundedCornerShape(4.dp))
+                .border(1.dp, BORDER, RoundedCornerShape(4.dp))
+                .padding(16.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("LAST 24H", color = INK_DIM, fontFamily = MONO, fontSize = 10.sp,
+                    letterSpacing = 2.sp, modifier = Modifier.weight(1f))
+                Pulse()
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(formatBytes(total), color = PHOSPHOR, fontFamily = MONO, fontSize = 22.sp,
+                fontWeight = FontWeight.Bold, letterSpacing = 3.sp)
+            Spacer(Modifier.height(12.dp))
+            KvLine("active link", activeNet)
+            KvLine("apps with traffic", displayed.size.toString())
+            KvLine("total tx", formatBytes(rows.sumOf { it.txBytes }))
+            KvLine("total rx", formatBytes(rows.sumOf { it.rxBytes }))
+        }
+        Spacer(Modifier.height(12.dp))
+        Row {
+            ToggleChip("show system", includeSystem) { includeSystem = !includeSystem }
+            Spacer(Modifier.width(8.dp))
+            ToggleChip(if (loading) "..." else "refresh", false) { refresh() }
+        }
+        Spacer(Modifier.height(10.dp))
+        SectionHeader("by app (tx + rx)")
+        Spacer(Modifier.height(6.dp))
+        if (displayed.isEmpty()) {
+            BodyBlock("(no traffic yet — let some time pass)")
+        } else {
+            LazyColumn(Modifier.weight(1f).fillMaxWidth()) {
+                items(displayed) { row -> NetRow(row) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NetRow(row: NetworkUsage.Row) {
+    Column(
+        Modifier.fillMaxWidth()
+            .padding(vertical = 4.dp)
+            .background(SURFACE, RoundedCornerShape(3.dp))
+            .border(1.dp, BORDER, RoundedCornerShape(3.dp))
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(row.label, color = INK, fontFamily = MONO, fontSize = 13.sp,
+                fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            Text(formatBytes(row.total), color = PHOSPHOR, fontFamily = MONO,
+                fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        }
+        Spacer(Modifier.height(2.dp))
+        Row {
+            Text("tx ${formatBytes(row.txBytes)}", color = AMBER.copy(alpha = 0.9f),
+                fontFamily = MONO, fontSize = 10.sp, modifier = Modifier.weight(1f))
+            Text("rx ${formatBytes(row.rxBytes)}", color = INK_DIM,
+                fontFamily = MONO, fontSize = 10.sp)
+        }
+        if (row.packageName.isNotEmpty()) {
+            Text(row.packageName, color = INK_DIM, fontFamily = MONO, fontSize = 9.sp)
+        }
+    }
+}
+
+@Composable
+private fun ToggleChip(label: String, on: Boolean, onClick: () -> Unit) {
+    val src = remember { MutableInteractionSource() }
+    val color = if (on) PHOSPHOR else INK_DIM
+    Box(
+        Modifier
+            .background(if (on) PHOSPHOR.copy(alpha = 0.12f) else Color.Transparent,
+                RoundedCornerShape(2.dp))
+            .border(1.dp, if (on) PHOSPHOR else BORDER, RoundedCornerShape(2.dp))
+            .clickable(interactionSource = src, indication = null) { onClick() }
+            .padding(horizontal = 12.dp, vertical = 6.dp)
+    ) {
+        Text(label.uppercase(), color = color, fontFamily = MONO, fontSize = 10.sp,
+            letterSpacing = 2.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+private fun formatBytes(b: Long): String {
+    if (b <= 0) return "0 B"
+    val units = arrayOf("B", "KB", "MB", "GB", "TB")
+    var v = b.toDouble()
+    var i = 0
+    while (v >= 1024 && i < units.size - 1) { v /= 1024; i++ }
+    return if (i == 0) "${b} B" else "%.1f %s".format(v, units[i])
+}
+
+/* ───────────────────────── SCAN (shoulder-surfer detect) ───────────────────────── */
+
+private val shadowScanner = ShadowScanner()
+
+@Composable
+private fun ScanScreen() {
+    val ctx = LocalContext.current
+    val owner = LocalLifecycleOwner.current
+    var hasCamPerm by remember { mutableStateOf(
+        ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA)
+            == PackageManager.PERMISSION_GRANTED
+    ) }
+    var state by remember { mutableStateOf(shadowScanner.state) }
+
+    val camPerm = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> hasCamPerm = granted }
+
+    LaunchedEffect(state.running) {
+        while (true) { state = shadowScanner.state; delay(120) }
+    }
+    DisposableEffect(Unit) {
+        onDispose { shadowScanner.unbind(ctx) }
+    }
+
+    Column(
+        Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(top = 18.dp)
+            .verticalScroll(rememberScrollState())
+    ) {
+        ScanStatusPanel(state)
+        Spacer(Modifier.height(14.dp))
+        if (!hasCamPerm) {
+            ActionButton("GRANT CAMERA") { camPerm.launch(Manifest.permission.CAMERA) }
+        }
+        if (hasCamPerm) {
+            Spacer(Modifier.height(16.dp))
+            SectionHeader("front cam preview")
+            Spacer(Modifier.height(8.dp))
+            Box(
+                Modifier.fillMaxWidth().height(280.dp)
+                    .background(Color.Black, RoundedCornerShape(4.dp))
+                    .border(1.dp,
+                        when (state.alert) {
+                            ShadowScanner.Alert.SHOULDER_SURFER -> AMBER
+                            else -> BORDER
+                        }, RoundedCornerShape(4.dp))
+            ) {
+                AndroidView(
+                    factory = { c ->
+                        PreviewView(c).also { pv ->
+                            pv.scaleType = PreviewView.ScaleType.FILL_CENTER
+                            shadowScanner.bind(c, owner, pv)
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(4.dp))
+                )
+                if (state.alert == ShadowScanner.Alert.SHOULDER_SURFER) {
+                    Box(
+                        Modifier.fillMaxWidth()
+                            .background(AMBER.copy(alpha = 0.2f))
+                            .padding(8.dp)
+                    ) {
+                        Text("EYES ON SCREEN  ::  ${state.faceCount} faces",
+                            color = AMBER, fontFamily = MONO, fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(20.dp))
+        Disclaimer(
+            "SCAN streams the front camera through on-device ML Kit face detection. " +
+                "Frames never leave the phone — no recording, no upload. Alert fires " +
+                "when 2+ faces are visible for >2s. Won't catch hidden mirrors, " +
+                "magnifiers, or long-lens cameras across a room. Will false-positive " +
+                "when you're showing your screen to someone on purpose."
+        )
+        Spacer(Modifier.height(20.dp))
+    }
+}
+
+@Composable
+private fun ScanStatusPanel(state: ShadowScanner.State) {
+    val (label, color) = when (state.alert) {
+        ShadowScanner.Alert.SHOULDER_SURFER -> "SHOULDER SURFER" to AMBER
+        ShadowScanner.Alert.ONE_FACE -> "1 FACE" to PHOSPHOR
+        ShadowScanner.Alert.NO_FACE -> if (state.running) "CLEAR" to PHOSPHOR else "IDLE" to INK_DIM
+        ShadowScanner.Alert.CLEAR -> "CLEAR" to PHOSPHOR
+    }
+    Column(
+        Modifier.fillMaxWidth()
+            .background(SURFACE, RoundedCornerShape(4.dp))
+            .border(1.dp, BORDER, RoundedCornerShape(4.dp))
+            .padding(16.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("WATCH", color = INK_DIM, fontFamily = MONO, fontSize = 10.sp,
+                letterSpacing = 2.sp, modifier = Modifier.weight(1f))
+            if (state.running) Pulse()
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(label, color = color, fontFamily = MONO, fontSize = 22.sp,
+            fontWeight = FontWeight.Bold, letterSpacing = 3.sp)
+        Spacer(Modifier.height(12.dp))
+        KvLine("faces visible", state.faceCount.toString())
+        KvLine("running", if (state.running) "yes" else "no")
+    }
+}
+
 /* ───────────────────────── ABOUT ───────────────────────── */
 
 @Composable
@@ -641,17 +1060,28 @@ private fun AboutScreen() {
         SectionHeader("what bastion does")
         Spacer(Modifier.height(8.dp))
         BodyBlock(
-            "BASTION is two independent tools:",
+            "BASTION is a small-tools toolbox for on-device privacy:",
             "",
-            "01 DNS — a config wizard for Android's built-in Private DNS feature. " +
-                "We point your phone at a hosted DoT resolver that filters malware, " +
-                "phishing, and (depending on provider) ads + trackers. The OS does the " +
-                "DNS resolution; bastion is just the wizard. Works on every app, can't " +
-                "break your internet, costs zero battery.",
+            "01 DNS — config wizard for Android's built-in Private DNS feature. " +
+                "Points your phone at a hosted DoT resolver that filters malware, " +
+                "phishing, and (depending on provider) ads + trackers. The OS does " +
+                "the resolution; bastion is just the wizard. Works on every app, " +
+                "can't break your internet, costs zero battery.",
             "",
             "02 SHIELD — generates audio designed to raise the noise floor in the " +
-                "speech band of nearby microphones. Useful for in-person privacy in a " +
-                "small bubble. Not a force field.",
+                "speech band of nearby microphones. Useful for in-person privacy in " +
+                "a small bubble.",
+            "",
+            "03 ECHO — live FFT of the 18–22 kHz band where SilverPush-style " +
+                "ultrasonic ad/tracking beacons live. Surfaces what your phone hears " +
+                "that you can't.",
+            "",
+            "04 NET — per-app data-usage ledger. Catches apps quietly uploading " +
+                "in the background. Bytes only — never destinations or content.",
+            "",
+            "05 SCAN — front-cam shoulder-surfer detection. On-device ML Kit " +
+                "counts faces visible to the front lens; alerts when someone joins " +
+                "yours. No frames leave the phone.",
         )
 
         Spacer(Modifier.height(20.dp))
@@ -669,6 +1099,11 @@ private fun AboutScreen() {
         SectionHeader("changelog")
         Spacer(Modifier.height(8.dp))
         BodyBlock(
+            "v0.4.0 — Added three sensors: ECHO (ultrasonic-beacon spectrum monitor, " +
+                "18–22 kHz FFT), NET (per-app data-usage ledger, requires Usage Access), " +
+                "SCAN (front-cam shoulder-surfer detection via on-device ML Kit face " +
+                "detection — frames never leave the phone).",
+            "",
             "v0.3.0 — Removed the on-device DNS sinkhole VPN entirely. It was " +
                 "fragile and occasionally broke users' internet (carrier middleboxes, " +
                 "DoH-by-default browsers, OS connectivity heuristics). Replaced with " +
@@ -684,7 +1119,7 @@ private fun AboutScreen() {
         BodyBlock(
             "source:   github.com/1800bobrossdotcom-byte/bastion-mobile",
             "issues:   github.com/1800bobrossdotcom-byte/bastion-mobile/issues",
-            "version:  0.3.0 (build 10)",
+            "version:  0.4.0 (build 11)",
         )
         Spacer(Modifier.height(24.dp))
     }

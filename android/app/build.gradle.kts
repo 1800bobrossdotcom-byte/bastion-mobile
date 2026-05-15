@@ -29,8 +29,8 @@ android {
         applicationId = "cam.bastion.mobile"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "0.3.0"
+        versionCode = 11
+        versionName = "0.4.0"
         vectorDrawables { useSupportLibrary = true }
     }
 
@@ -83,7 +83,11 @@ dependencies {
     implementation(libs.androidx.material3)
     debugImplementation(libs.androidx.ui.tooling)
 
-    // v0.3.0: removed okhttp (no more blocklist fetch) and Room (no more local
-    // audit DB). Blocking moved off-device to system Private DNS — see
-    // settings/Settings.kt.
+    // v0.4.0 ECHO/SCAN: CameraX for front-cam preview + frame analysis,
+    // ML Kit on-device face detection for shadow-scan (shoulder-surfer alert).
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
+    implementation(libs.mlkit.face.detection)
 }
