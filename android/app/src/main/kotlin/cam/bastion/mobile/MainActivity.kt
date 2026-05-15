@@ -104,7 +104,7 @@ private fun TopBar(tab: Tab) {
         Column(Modifier.weight(1f)) {
             Text("BASTION", color = PHOSPHOR, fontFamily = MONO, fontSize = 22.sp,
                 fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
-            Text("v0.2.5 :: ${tab.short} ${tab.long}", color = INK_DIM,
+            Text("v0.2.6 :: ${tab.short} ${tab.long}", color = INK_DIM,
                 fontFamily = MONO, fontSize = 10.sp, letterSpacing = 2.sp)
         }
         Pulse()

@@ -96,30 +96,18 @@ class BastionVpnService : VpnService() {
         // travel through our tun. Everything else (web, apps, IPv6) keeps using
         // the underlying network. Without this, the entire phone's internet
         // dies the moment we capture 0.0.0.0/0 because we drop non-DNS packets.
-        //
-        // Excluding our own package guarantees that any network call BASTION
-        // itself makes — most importantly the periodic blocklist refresh —
-        // never round-trips through its own DNS forwarder. Without this,
-        // refreshing the blocklist would briefly route the OkHttp DNS lookup
-        // through the tun and could leave the phone feeling "offline" until
-        // the in-flight queries drained.
-        val builder = Builder()
+        tun = Builder()
             .setSession("BASTION")
             .addAddress("10.42.0.2", 30)
             .addRoute(upstream, 32)
             .addDnsServer(upstream)
             .allowFamily(android.system.OsConstants.AF_INET)
             .setMtu(1500)
-        try {
-            builder.addDisallowedApplication(packageName)
-        } catch (_: android.content.pm.PackageManager.NameNotFoundException) {
-            // Should never happen — we're excluding ourselves.
-        }
-        tun = builder.establish() ?: run {
-            Log.e(TAG, "VpnService.Builder.establish() returned null")
-            stopSelf()
-            return
-        }
+            .establish() ?: run {
+                Log.e(TAG, "VpnService.Builder.establish() returned null")
+                stopSelf()
+                return
+            }
 
         scope.launch {
             BlocklistRepo.refreshIfStale(applicationContext)
