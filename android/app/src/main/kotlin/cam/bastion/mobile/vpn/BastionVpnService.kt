@@ -44,6 +44,7 @@ class BastionVpnService : VpnService() {
         private const val TAG = "BastionVPN"
         private const val NOTIF_ID = 1001
         private const val CHANNEL_ID = "bastion-sensor"
+        const val ACTION_STOP = "cam.bastion.mobile.vpn.STOP"
         /** True between onStartCommand returning and onDestroy completing. UI reads this. */
         @Volatile var isRunning: Boolean = false; private set
     }
@@ -52,10 +53,39 @@ class BastionVpnService : VpnService() {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Honour explicit stop requests synchronously. We were started via
+        // startForegroundService() so we MUST call startForeground at least once
+        // before stopping, otherwise Android crashes the process.
+        if (intent?.action == ACTION_STOP) {
+            try { startForeground(NOTIF_ID, buildNotification()) } catch (_: Throwable) {}
+            teardown()
+            return START_NOT_STICKY
+        }
         startForeground(NOTIF_ID, buildNotification())
         startVpn()
         isRunning = true
-        return START_STICKY
+        return START_NOT_STICKY
+    }
+
+    /**
+     * Synchronous teardown. Flips isRunning false BEFORE removing the
+     * notification so the polling UI sees "OFF" on its next tick. Closing the
+     * tun fd makes the blocking input.read() in runDnsLoop return -1 immediately
+     * so the DNS coroutine exits without waiting for cancellation. This is what
+     * actually restores the phone's internet — without it the OS keeps the
+     * route to the upstream DNS server pinned for several seconds.
+     */
+    private fun teardown() {
+        isRunning = false
+        try { tun?.close() } catch (_: Throwable) {}
+        tun = null
+        scope.cancel()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION") stopForeground(true)
+        }
+        stopSelf()
     }
 
     private fun startVpn() {
@@ -195,10 +225,17 @@ class BastionVpnService : VpnService() {
         return out.array()
     }
 
+    override fun onRevoke() {
+        // User killed the VPN from system settings.
+        teardown()
+        super.onRevoke()
+    }
+
     override fun onDestroy() {
         isRunning = false
         scope.cancel()
         try { tun?.close() } catch (_: Throwable) {}
+        tun = null
         super.onDestroy()
     }
 

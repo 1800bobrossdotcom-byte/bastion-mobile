@@ -104,7 +104,7 @@ private fun TopBar(tab: Tab) {
         Column(Modifier.weight(1f)) {
             Text("BASTION", color = PHOSPHOR, fontFamily = MONO, fontSize = 22.sp,
                 fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
-            Text("v0.2.2 :: ${tab.short} ${tab.long}", color = INK_DIM,
+            Text("v0.2.3 :: ${tab.short} ${tab.long}", color = INK_DIM,
                 fontFamily = MONO, fontSize = 10.sp, letterSpacing = 2.sp)
         }
         Pulse()
@@ -226,7 +226,11 @@ private fun SensorScreen() {
     ) {
         BigPowerButton(active = sensorActive) {
             if (sensorActive) {
-                ctx.stopService(Intent(ctx, BastionVpnService::class.java))
+                // Send explicit STOP action so the service tears down
+                // synchronously and frees the route back to normal internet.
+                val stopIntent = Intent(ctx, BastionVpnService::class.java)
+                    .setAction(BastionVpnService.ACTION_STOP)
+                ContextCompat.startForegroundService(ctx, stopIntent)
                 sensorActive = false
             } else {
                 val intent = VpnService.prepare(ctx)

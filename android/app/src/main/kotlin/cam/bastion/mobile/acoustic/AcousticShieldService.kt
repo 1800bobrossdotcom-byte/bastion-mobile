@@ -57,6 +57,7 @@ class AcousticShieldService : Service() {
         internal fun publishLevel(v: Float) { outputLevel = v }
 
         const val ACTION_UPDATE = "cam.bastion.mobile.acoustic.UPDATE"
+        const val ACTION_STOP = "cam.bastion.mobile.acoustic.STOP"
 
         fun start(ctx: Context, mode: Mode, volume: Float, intensity: Float, target: Int) {
             val i = Intent(ctx, AcousticShieldService::class.java)
@@ -76,8 +77,21 @@ class AcousticShieldService : Service() {
         }
 
         fun stop(ctx: Context) {
-            ctx.stopService(Intent(ctx, AcousticShieldService::class.java))
+            // Send an explicit STOP action via startForegroundService so the
+            // service receives it even when bound state is unclear. The service
+            // tears down synchronously inside onStartCommand. We also flip the
+            // public state immediately so the UI shows OFF on its next poll
+            // even if the service takes a moment to fully destroy.
+            currentMode = Mode.OFF
             outputLevel = 0f
+            val i = Intent(ctx, AcousticShieldService::class.java).setAction(ACTION_STOP)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
+                else ctx.startService(i)
+            } catch (_: Throwable) {
+                // App might be backgrounded — fall back to plain stopService.
+                ctx.stopService(Intent(ctx, AcousticShieldService::class.java))
+            }
         }
     }
 
@@ -89,6 +103,27 @@ class AcousticShieldService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Honour explicit stop requests synchronously. Started via
+        // startForegroundService(), so we MUST call startForeground once before
+        // stopping or Android crashes the process.
+        if (intent?.action == ACTION_STOP) {
+            try {
+                ServiceCompat.startForeground(this, NOTIF_ID, notification(Mode.OFF),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+            } catch (_: Throwable) {}
+            currentMode = Mode.OFF
+            outputLevel = 0f
+            job?.cancel()
+            teardownAudio()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION") stopForeground(true)
+            }
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         val mode = runCatching { Mode.valueOf(intent?.getStringExtra(EXTRA_MODE) ?: "OFF") }
             .getOrDefault(Mode.OFF)
         currentVolume = intent?.getFloatExtra(EXTRA_VOLUME, 0.6f) ?: 0.6f
@@ -117,11 +152,11 @@ class AcousticShieldService : Service() {
         }
         // If already running this mode, just keep going — params are already updated above.
         if (mode == currentMode && job?.isActive == true) {
-            return START_STICKY
+            return START_NOT_STICKY
         }
         currentMode = mode
         runMode(mode)
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun runMode(mode: Mode) {
