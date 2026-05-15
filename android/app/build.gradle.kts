@@ -29,8 +29,8 @@ android {
         applicationId = "cam.bastion.mobile"
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "0.2.7"
+        versionCode = 10
+        versionName = "0.3.0"
         vectorDrawables { useSupportLibrary = true }
     }
 
@@ -83,8 +83,7 @@ dependencies {
     implementation(libs.androidx.material3)
     debugImplementation(libs.androidx.ui.tooling)
 
-    implementation(libs.okhttp)
-    implementation(libs.androidx.room.runtime)
-    implementation(libs.androidx.room.ktx)
-    ksp(libs.androidx.room.compiler)
+    // v0.3.0: removed okhttp (no more blocklist fetch) and Room (no more local
+    // audit DB). Blocking moved off-device to system Private DNS — see
+    // settings/Settings.kt.
 }

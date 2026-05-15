@@ -3,8 +3,8 @@ package cam.bastion.mobile
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.VpnService
 import android.os.Bundle
+import android.provider.Settings as AndroidSettings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -16,8 +16,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -30,30 +28,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import cam.bastion.mobile.acoustic.AcousticShieldService
-import cam.bastion.mobile.audit.AuditDb
-import cam.bastion.mobile.audit.AuditEvent
-import cam.bastion.mobile.blocklist.BlocklistRepo
 import cam.bastion.mobile.settings.Settings
 import cam.bastion.mobile.theme.AMBER
 import cam.bastion.mobile.theme.BORDER
 import cam.bastion.mobile.theme.PHOSPHOR
 import cam.bastion.mobile.theme.SURFACE
-import cam.bastion.mobile.vpn.BastionVpnService
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 private val MONO = FontFamily.Monospace
 private val INK_DIM = Color.White.copy(alpha = 0.45f)
@@ -67,25 +57,23 @@ class MainActivity : ComponentActivity() {
 }
 
 private enum class Tab(val short: String, val long: String) {
-    SENSOR("01", "sensor"),
+    DNS("01", "dns"),
     SHIELD("02", "shield"),
-    LOG("03", "audit"),
-    SETTINGS("04", "conf"),
+    ABOUT("03", "about"),
 }
 
 @Composable
 fun BastionApp() {
-    var tab by rememberSaveable { mutableStateOf(Tab.SENSOR) }
+    var tab by rememberSaveable { mutableStateOf(Tab.DNS) }
     Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
         Column(Modifier.fillMaxSize().background(Color.Black)) {
             TopBar(tab)
             ServiceStatusStrip()
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 when (tab) {
-                    Tab.SENSOR -> SensorScreen()
+                    Tab.DNS -> DnsScreen()
                     Tab.SHIELD -> ShieldScreen()
-                    Tab.LOG -> LogScreen()
-                    Tab.SETTINGS -> SettingsScreen()
+                    Tab.ABOUT -> AboutScreen()
                 }
             }
             BottomTabs(tab) { tab = it }
@@ -104,7 +92,7 @@ private fun TopBar(tab: Tab) {
         Column(Modifier.weight(1f)) {
             Text("BASTION", color = PHOSPHOR, fontFamily = MONO, fontSize = 22.sp,
                 fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
-            Text("v0.2.7 :: ${tab.short} ${tab.long}", color = INK_DIM,
+            Text("v0.3.0 :: ${tab.short} ${tab.long}", color = INK_DIM,
                 fontFamily = MONO, fontSize = 10.sp, letterSpacing = 2.sp)
         }
         Pulse()
@@ -113,18 +101,20 @@ private fun TopBar(tab: Tab) {
 }
 
 /**
- * Persistent two-pill status row visible on every tab so the user can see at a
- * glance that Sensor and Shield run independently and can be active together.
+ * Two-pill status row: DNS shows whether system Private DNS matches the
+ * provider the user picked in this app; SHIELD shows the acoustic shield mode.
+ * They are independent — DNS doesn't run any process; SHIELD runs an FGS.
  */
 @Composable
 private fun ServiceStatusStrip() {
-    var sensorOn by remember { mutableStateOf(BastionVpnService.isRunning) }
+    val ctx = LocalContext.current
+    var dnsActive by remember { mutableStateOf(currentlyUsingSelectedProvider(ctx)) }
     var shieldMode by remember { mutableStateOf(AcousticShieldService.currentMode) }
     LaunchedEffect(Unit) {
         while (true) {
-            sensorOn = BastionVpnService.isRunning
+            dnsActive = currentlyUsingSelectedProvider(ctx)
             shieldMode = AcousticShieldService.currentMode
-            delay(400)
+            delay(800)
         }
     }
     val shieldOn = shieldMode != AcousticShieldService.Mode.OFF
@@ -133,7 +123,7 @@ private fun ServiceStatusStrip() {
             .padding(horizontal = 20.dp, vertical = 8.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        StatusPill("SENSOR", if (sensorOn) "ON" else "OFF", sensorOn, Modifier.weight(1f))
+        StatusPill("DNS", if (dnsActive) "ACTIVE" else "OFF", dnsActive, Modifier.weight(1f))
         StatusPill("SHIELD",
             if (shieldOn) shieldMode.name else "OFF",
             shieldOn, Modifier.weight(1f))
@@ -199,105 +189,220 @@ private fun BottomTabs(active: Tab, onSelect: (Tab) -> Unit) {
     }
 }
 
-/* ───────────────────────── SENSOR ───────────────────────── */
+/* ───────────────────────── DNS (Private DNS config wizard) ───────────────────────── */
+
+/** Reads the system-wide Private DNS specifier (the hostname the user typed
+ *  into Settings → Network → Private DNS). Returns null if Private DNS is off
+ *  or set to "Automatic". Falls back gracefully on older Android. */
+private fun systemPrivateDns(ctx: android.content.Context): String? = try {
+    AndroidSettings.Global.getString(ctx.contentResolver, "private_dns_specifier")
+        ?.takeIf { it.isNotBlank() }
+} catch (_: Throwable) { null }
+
+private fun systemPrivateDnsMode(ctx: android.content.Context): String = try {
+    AndroidSettings.Global.getString(ctx.contentResolver, "private_dns_mode") ?: "off"
+} catch (_: Throwable) { "off" }
+
+private fun currentlyUsingSelectedProvider(ctx: android.content.Context): Boolean {
+    val selected = Settings.provider(ctx)
+    val sys = systemPrivateDns(ctx) ?: return false
+    return sys.equals(selected.hostname, ignoreCase = true)
+}
 
 @Composable
-private fun SensorScreen() {
+private fun DnsScreen() {
     val ctx = LocalContext.current
-    var sensorActive by remember { mutableStateOf(BastionVpnService.isRunning) }
-    LaunchedEffect(Unit) {
-        while (true) { sensorActive = BastionVpnService.isRunning; delay(400) }
-    }
-    val dao = remember { AuditDb.get(ctx).dao() }
-    val count by dao.countFlow().collectAsStateWithLifecycle(initialValue = 0)
+    val clipboard = LocalClipboardManager.current
+    var provider by remember { mutableStateOf(Settings.provider(ctx)) }
+    var sysHostname by remember { mutableStateOf(systemPrivateDns(ctx)) }
+    var sysMode by remember { mutableStateOf(systemPrivateDnsMode(ctx)) }
 
-    val vpnPermission = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == android.app.Activity.RESULT_OK) {
-            ContextCompat.startForegroundService(ctx, Intent(ctx, BastionVpnService::class.java))
-            sensorActive = true
+    LaunchedEffect(Unit) {
+        // Re-poll the system Private DNS state so the status reflects user
+        // returning from Settings without a full app restart.
+        while (true) {
+            sysHostname = systemPrivateDns(ctx)
+            sysMode = systemPrivateDnsMode(ctx)
+            delay(1000)
         }
     }
+
+    val active = sysHostname?.equals(provider.hostname, ignoreCase = true) == true
 
     Column(
-        Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(top = 24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
+        Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(top = 18.dp)
+            .verticalScroll(rememberScrollState())
     ) {
-        BigPowerButton(active = sensorActive) {
-            if (sensorActive) {
-                // Send explicit STOP action so the service tears down
-                // synchronously and frees the route back to normal internet.
-                val stopIntent = Intent(ctx, BastionVpnService::class.java)
-                    .setAction(BastionVpnService.ACTION_STOP)
-                ContextCompat.startForegroundService(ctx, stopIntent)
-                sensorActive = false
-            } else {
-                val intent = VpnService.prepare(ctx)
-                if (intent != null) vpnPermission.launch(intent)
-                else {
-                    ContextCompat.startForegroundService(ctx, Intent(ctx, BastionVpnService::class.java))
-                    sensorActive = true
-                }
+        // Big status panel
+        StatusPanel(
+            active = active,
+            provider = provider,
+            sysHostname = sysHostname,
+            sysMode = sysMode,
+        )
+        Spacer(Modifier.height(14.dp))
+
+        // Primary action: open system Private DNS settings
+        ActionButton("OPEN PRIVATE DNS SETTINGS") {
+            try {
+                ctx.startActivity(
+                    Intent("android.settings.WIRELESS_SETTINGS")
+                        .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (_: Throwable) {
+                ctx.startActivity(
+                    Intent(AndroidSettings.ACTION_SETTINGS)
+                        .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
             }
         }
-        Spacer(Modifier.height(20.dp))
-        Text(if (sensorActive) "DNS SENSOR ACTIVE" else "SENSOR OFFLINE",
-            color = if (sensorActive) PHOSPHOR else AMBER,
-            fontFamily = MONO, fontSize = 14.sp, letterSpacing = 3.sp,
-            fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(28.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-            Stat(label = "blocks", value = count.toString())
-            Stat(label = "hosts", value = BlocklistRepo.hostCount.toString())
-            Stat(label = "upstream", value = Settings.resolver(ctx).ip)
+        Spacer(Modifier.height(8.dp))
+        ActionButton("COPY HOSTNAME", dim = !provider.available) {
+            if (provider.available) {
+                clipboard.setText(AnnotatedString(provider.hostname))
+            }
         }
-        Spacer(Modifier.height(28.dp))
-        Disclaimer(
-            "BASTION runs silently in the background filtering DNS lookups " +
-                "against URLhaus + OpenPhish. All other traffic uses your normal " +
-                "network — leave it on. It cannot stop spyware or detect Pegasus."
+
+        Spacer(Modifier.height(20.dp))
+        SectionHeader("how to enable")
+        Spacer(Modifier.height(8.dp))
+        Steps(
+            "1. Tap [OPEN PRIVATE DNS SETTINGS] above.",
+            "2. Find \"Private DNS\" (under Network & Internet → Advanced on most phones).",
+            "3. Choose \"Private DNS provider hostname\".",
+            "4. Paste: ${provider.hostname}",
+            "5. Tap Save. Return here — status will turn green.",
         )
+
+        Spacer(Modifier.height(24.dp))
+        SectionHeader("provider")
+        Spacer(Modifier.height(8.dp))
+        Settings.Provider.entries.forEach { p ->
+            ProviderRow(p, p == provider) {
+                if (p.available) {
+                    provider = p
+                    Settings.setProvider(ctx, p)
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+        }
+        Spacer(Modifier.height(20.dp))
+        Disclaimer(
+            "Private DNS is an OS-level setting — bastion is just a config wizard. " +
+                "Once set, your phone uses the chosen DoT resolver for ALL apps, " +
+                "including ones that pin DNS. We never see your queries; the resolver " +
+                "operator does. Pick one whose privacy policy you trust."
+        )
+        Spacer(Modifier.height(20.dp))
     }
 }
 
 @Composable
-private fun BigPowerButton(active: Boolean, onClick: () -> Unit) {
+private fun StatusPanel(
+    active: Boolean,
+    provider: Settings.Provider,
+    sysHostname: String?,
+    sysMode: String,
+) {
     val color = if (active) PHOSPHOR else AMBER
+    Column(
+        Modifier.fillMaxWidth()
+            .background(SURFACE, RoundedCornerShape(4.dp))
+            .border(1.dp, BORDER, RoundedCornerShape(4.dp))
+            .padding(16.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("STATUS", color = INK_DIM, fontFamily = MONO, fontSize = 10.sp,
+                letterSpacing = 2.sp, modifier = Modifier.weight(1f))
+            if (active) Pulse()
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            if (active) "FILTERING ACTIVE" else "NOT CONFIGURED",
+            color = color, fontFamily = MONO, fontSize = 22.sp,
+            fontWeight = FontWeight.Bold, letterSpacing = 3.sp,
+        )
+        Spacer(Modifier.height(12.dp))
+        KvLine("selected", provider.short)
+        KvLine("system mode", sysMode)
+        KvLine("system hostname", sysHostname ?: "(none)")
+    }
+}
+
+@Composable
+private fun KvLine(k: String, v: String) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+        Text(k.uppercase(), color = INK_DIM, fontFamily = MONO, fontSize = 10.sp,
+            letterSpacing = 2.sp, modifier = Modifier.width(120.dp))
+        Text(v, color = INK, fontFamily = MONO, fontSize = 11.sp)
+    }
+}
+
+@Composable
+private fun Steps(vararg lines: String) {
+    Column(
+        Modifier.fillMaxWidth()
+            .background(SURFACE, RoundedCornerShape(3.dp))
+            .border(1.dp, BORDER, RoundedCornerShape(3.dp))
+            .padding(14.dp)
+    ) {
+        lines.forEachIndexed { i, line ->
+            if (i > 0) Spacer(Modifier.height(8.dp))
+            Text(line, color = INK, fontFamily = MONO, fontSize = 11.sp, lineHeight = 16.sp)
+        }
+    }
+}
+
+@Composable
+private fun ProviderRow(p: Settings.Provider, on: Boolean, onClick: () -> Unit) {
     val src = remember { MutableInteractionSource() }
-    Box(
-        Modifier.size(180.dp)
-            .clip(CircleShape)
-            .background(color.copy(alpha = 0.08f))
-            .border(2.dp, color, CircleShape)
-            .clickable(interactionSource = src, indication = null) { onClick() },
-        contentAlignment = Alignment.Center,
+    val enabled = p.available
+    val borderColor = when {
+        on -> PHOSPHOR
+        !enabled -> BORDER.copy(alpha = 0.5f)
+        else -> BORDER
+    }
+    val nameColor = when {
+        on -> PHOSPHOR
+        !enabled -> INK_DIM
+        else -> INK
+    }
+    Row(
+        Modifier.fillMaxWidth()
+            .background(if (on) PHOSPHOR.copy(alpha = 0.10f) else SURFACE,
+                RoundedCornerShape(3.dp))
+            .border(1.dp, borderColor, RoundedCornerShape(3.dp))
+            .clickable(interactionSource = src, indication = null, enabled = enabled) { onClick() }
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.Top,
     ) {
         Box(
-            Modifier.size(140.dp).clip(CircleShape)
-                .background(color.copy(alpha = if (active) 0.18f else 0.04f))
-                .border(1.dp, color.copy(alpha = 0.4f), CircleShape),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                if (active) "STOP" else "START",
-                color = color,
-                fontFamily = MONO,
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 4.sp,
-            )
+            Modifier.size(14.dp).clip(CircleShape)
+                .background(if (on) PHOSPHOR else Color.Transparent)
+                .border(1.dp, if (on) PHOSPHOR else INK_DIM, CircleShape)
+        )
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(p.short, color = nameColor, fontFamily = MONO, fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                if (!enabled) {
+                    Spacer(Modifier.width(8.dp))
+                    Box(
+                        Modifier.background(AMBER.copy(alpha = 0.15f), RoundedCornerShape(2.dp))
+                            .padding(horizontal = 5.dp, vertical = 1.dp)
+                    ) {
+                        Text("SOON", color = AMBER, fontFamily = MONO, fontSize = 8.sp,
+                            fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                    }
+                }
+            }
+            Text(p.hostname, color = if (on) PHOSPHOR.copy(alpha = 0.7f) else INK_DIM,
+                fontFamily = MONO, fontSize = 10.sp)
+            Spacer(Modifier.height(3.dp))
+            Text(p.description, color = INK_DIM, fontFamily = MONO,
+                fontSize = 10.sp, lineHeight = 14.sp)
         }
-    }
-}
-
-@Composable
-private fun Stat(label: String, value: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(value, color = PHOSPHOR, fontFamily = MONO, fontSize = 18.sp,
-            fontWeight = FontWeight.Bold)
-        Text(label.uppercase(), color = INK_DIM, fontFamily = MONO, fontSize = 9.sp,
-            letterSpacing = 2.sp)
     }
 }
 
@@ -525,151 +630,67 @@ private fun BigSliderInt(label: String, valueLabel: String, value: Int, range: I
     }
 }
 
-/* ───────────────────────── LOG ───────────────────────── */
+/* ───────────────────────── ABOUT ───────────────────────── */
 
 @Composable
-private fun LogScreen() {
-    val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val dao = remember { AuditDb.get(ctx).dao() }
-    val events by dao.recent(500).collectAsStateWithLifecycle(initialValue = emptyList())
-    val count by dao.countFlow().collectAsStateWithLifecycle(initialValue = 0)
-    val timeFmt = remember { SimpleDateFormat("HH:mm:ss", Locale.US) }
-    val dateFmt = remember { SimpleDateFormat("MMM dd", Locale.US) }
-
-    Column(Modifier.fillMaxSize()) {
-        // Stats bar
-        Row(
-            Modifier.fillMaxWidth().padding(20.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(Modifier.weight(1f)) {
-                Text("BLOCKED LOOKUPS", color = INK_DIM, fontFamily = MONO,
-                    fontSize = 10.sp, letterSpacing = 2.sp)
-                Text(count.toString(), color = PHOSPHOR, fontFamily = MONO,
-                    fontSize = 32.sp, fontWeight = FontWeight.Bold)
-            }
-            val src = remember { MutableInteractionSource() }
-            Box(
-                Modifier.height(40.dp)
-                    .background(AMBER.copy(alpha = 0.08f), RoundedCornerShape(2.dp))
-                    .border(1.dp, AMBER.copy(alpha = 0.6f), RoundedCornerShape(2.dp))
-                    .clickable(interactionSource = src, indication = null) {
-                        scope.launch { dao.clear() }
-                    }
-                    .padding(horizontal = 16.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text("WIPE", color = AMBER, fontFamily = MONO, fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold, letterSpacing = 3.sp)
-            }
-        }
-        Divider(color = BORDER)
-        if (events.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("NO BLOCKS YET", color = INK_DIM, fontFamily = MONO,
-                        fontSize = 12.sp, letterSpacing = 2.sp)
-                    Spacer(Modifier.height(6.dp))
-                    Text("start the sensor to begin filtering",
-                        color = INK_DIM, fontFamily = MONO, fontSize = 10.sp)
-                }
-            }
-        } else {
-            LazyColumn(Modifier.fillMaxSize()) {
-                items(events, key = { it.id }) { ev ->
-                    AuditRow(ev, timeFmt, dateFmt)
-                    Divider(color = BORDER.copy(alpha = 0.4f))
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun AuditRow(ev: AuditEvent, timeFmt: SimpleDateFormat, dateFmt: SimpleDateFormat) {
-    val d = Date(ev.ts)
-    Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.width(64.dp)) {
-            Text(timeFmt.format(d), color = INK, fontFamily = MONO, fontSize = 12.sp,
-                fontWeight = FontWeight.Bold)
-            Text(dateFmt.format(d), color = INK_DIM, fontFamily = MONO, fontSize = 9.sp)
-        }
-        Spacer(Modifier.width(8.dp))
-        Box(Modifier.background(AMBER.copy(alpha = 0.15f), RoundedCornerShape(2.dp))
-            .padding(horizontal = 6.dp, vertical = 2.dp)) {
-            Text("BLOCK", color = AMBER, fontFamily = MONO, fontSize = 9.sp,
-                fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
-        }
-        Spacer(Modifier.width(10.dp))
-        Text(ev.host, color = PHOSPHOR, fontFamily = MONO, fontSize = 12.sp,
-            modifier = Modifier.weight(1f))
-    }
-}
-
-/* ───────────────────────── SETTINGS ───────────────────────── */
-
-@Composable
-private fun SettingsScreen() {
-    val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var resolver by remember { mutableStateOf(Settings.resolver(ctx)) }
-    var lastRefresh by remember { mutableLongStateOf(Settings.lastRefresh(ctx)) }
-    var hostCount by remember { mutableIntStateOf(BlocklistRepo.hostCount) }
-    var refreshing by remember { mutableStateOf(false) }
-    var refreshMsg by remember { mutableStateOf<String?>(null) }
-    val fmt = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US) }
-
+private fun AboutScreen() {
     Column(
         Modifier.fillMaxSize().padding(horizontal = 20.dp).padding(top = 18.dp)
             .verticalScroll(rememberScrollState())
     ) {
-        SectionHeader("upstream resolver")
+        SectionHeader("what bastion does")
         Spacer(Modifier.height(8.dp))
-        Settings.Resolver.entries.forEach { r ->
-            ResolverRow(r, r == resolver) {
-                resolver = r
-                Settings.setResolver(ctx, r)
-            }
-            Spacer(Modifier.height(6.dp))
-        }
-        Text("Restart sensor to apply.", color = INK_DIM, fontFamily = MONO,
-            fontSize = 10.sp, modifier = Modifier.padding(top = 6.dp))
-
-        Spacer(Modifier.height(28.dp))
-        SectionHeader("blocklist")
-        Spacer(Modifier.height(10.dp))
-        Row(Modifier.fillMaxWidth()) {
-            KvCell("hosts", hostCount.toString(), Modifier.weight(1f))
-            KvCell("last sync",
-                if (lastRefresh == 0L) "never" else fmt.format(Date(lastRefresh)),
-                Modifier.weight(1.4f))
-        }
-        Spacer(Modifier.height(10.dp))
-        refreshMsg?.let {
-            Text(it, color = AMBER, fontFamily = MONO, fontSize = 11.sp,
-                modifier = Modifier.padding(bottom = 6.dp))
-        }
-        ActionButton(if (refreshing) "REFRESHING..." else "REFRESH BLOCKLIST", refreshing) {
-            scope.launch {
-                refreshing = true; refreshMsg = null
-                val ok = BlocklistRepo.forceRefresh(ctx)
-                refreshing = false
-                lastRefresh = Settings.lastRefresh(ctx)
-                hostCount = BlocklistRepo.hostCount
-                refreshMsg = if (ok) "ok" else "failed (no network?)"
-            }
-        }
-
-        Spacer(Modifier.height(28.dp))
-        Disclaimer(
-            "Cloudflare and Quad9 publish privacy policies; Google logs more. " +
-                "The blocklist is fetched over HTTPS \u2014 no telemetry."
+        BodyBlock(
+            "BASTION is two independent tools:",
+            "",
+            "01 DNS — a config wizard for Android's built-in Private DNS feature. " +
+                "We point your phone at a hosted DoT resolver that filters malware, " +
+                "phishing, and (depending on provider) ads + trackers. The OS does the " +
+                "DNS resolution; bastion is just the wizard. Works on every app, can't " +
+                "break your internet, costs zero battery.",
+            "",
+            "02 SHIELD — generates audio designed to raise the noise floor in the " +
+                "speech band of nearby microphones. Useful for in-person privacy in a " +
+                "small bubble. Not a force field.",
         )
+
         Spacer(Modifier.height(20.dp))
+        SectionHeader("what bastion does NOT do")
+        Spacer(Modifier.height(8.dp))
+        BodyBlock(
+            "• Block spyware that's already on your device.",
+            "• Detect Pegasus / Predator / commercial implants.",
+            "• Inspect or scan inside other apps' sandboxes.",
+            "• Defeat directional mics or LRAD-class recording.",
+            "• Encrypt your traffic (use a real VPN for that).",
+        )
+
+        Spacer(Modifier.height(20.dp))
+        SectionHeader("changelog")
+        Spacer(Modifier.height(8.dp))
+        BodyBlock(
+            "v0.3.0 — Removed the on-device DNS sinkhole VPN entirely. It was " +
+                "fragile and occasionally broke users' internet (carrier middleboxes, " +
+                "DoH-by-default browsers, OS connectivity heuristics). Replaced with " +
+                "an OS-level Private DNS config wizard pointing at hosted DoT " +
+                "providers. Self-hosted bastion DNS coming once dns.bastion.cam is live.",
+            "",
+            "v0.2.7 — Last VPN-mode release. Final patch to the DNS sinkhole.",
+        )
+
+        Spacer(Modifier.height(20.dp))
+        SectionHeader("links")
+        Spacer(Modifier.height(8.dp))
+        BodyBlock(
+            "source:   github.com/1800bobrossdotcom-byte/bastion-mobile",
+            "issues:   github.com/1800bobrossdotcom-byte/bastion-mobile/issues",
+            "version:  0.3.0 (build 10)",
+        )
+        Spacer(Modifier.height(24.dp))
     }
 }
+
+/* ───────────────────────── shared ───────────────────────── */
 
 @Composable
 private fun SectionHeader(title: String) {
@@ -681,51 +702,6 @@ private fun SectionHeader(title: String) {
             letterSpacing = 3.sp, fontWeight = FontWeight.Bold)
     }
 }
-
-@Composable
-private fun ResolverRow(r: Settings.Resolver, on: Boolean, onClick: () -> Unit) {
-    val src = remember { MutableInteractionSource() }
-    Row(
-        Modifier.fillMaxWidth()
-            .background(if (on) PHOSPHOR.copy(alpha = 0.10f) else SURFACE,
-                RoundedCornerShape(3.dp))
-            .border(1.dp, if (on) PHOSPHOR else BORDER, RoundedCornerShape(3.dp))
-            .clickable(interactionSource = src, indication = null) { onClick() }
-            .padding(horizontal = 14.dp, vertical = 14.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(
-            Modifier.size(14.dp).clip(CircleShape)
-                .background(if (on) PHOSPHOR else Color.Transparent)
-                .border(1.dp, if (on) PHOSPHOR else INK_DIM, CircleShape)
-        )
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(r.ip, color = if (on) PHOSPHOR else INK, fontFamily = MONO,
-                fontSize = 14.sp, fontWeight = FontWeight.Bold)
-            Text(r.label.substringBefore(' '),
-                color = INK_DIM, fontFamily = MONO, fontSize = 10.sp)
-        }
-    }
-}
-
-@Composable
-private fun KvCell(label: String, value: String, modifier: Modifier = Modifier) {
-    Column(
-        modifier
-            .background(SURFACE, RoundedCornerShape(3.dp))
-            .border(1.dp, BORDER, RoundedCornerShape(3.dp))
-            .padding(12.dp)
-    ) {
-        Text(label.uppercase(), color = INK_DIM, fontFamily = MONO, fontSize = 9.sp,
-            letterSpacing = 2.sp)
-        Spacer(Modifier.height(4.dp))
-        Text(value, color = PHOSPHOR, fontFamily = MONO, fontSize = 13.sp,
-            fontWeight = FontWeight.Bold)
-    }
-}
-
-/* ───────────────────────── shared ───────────────────────── */
 
 @Composable
 private fun ActionButton(label: String, dim: Boolean = false, onClick: () -> Unit) {
@@ -740,6 +716,23 @@ private fun ActionButton(label: String, dim: Boolean = false, onClick: () -> Uni
         Text(label, color = PHOSPHOR.copy(alpha = if (dim) 0.6f else 1f),
             fontFamily = MONO, fontSize = 13.sp,
             fontWeight = FontWeight.Bold, letterSpacing = 3.sp)
+    }
+}
+
+@Composable
+private fun BodyBlock(vararg lines: String) {
+    Column(
+        Modifier.fillMaxWidth()
+            .background(SURFACE, RoundedCornerShape(3.dp))
+            .border(1.dp, BORDER, RoundedCornerShape(3.dp))
+            .padding(14.dp)
+    ) {
+        lines.forEach { line ->
+            Text(
+                if (line.isEmpty()) " " else line,
+                color = INK, fontFamily = MONO, fontSize = 11.sp, lineHeight = 16.sp,
+            )
+        }
     }
 }
 

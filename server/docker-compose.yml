@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  blocky:
+    image: spx01/blocky:v0.24
+    container_name: bastion-dns
+    restart: unless-stopped
+    network_mode: host
+    # host networking so blocky can bind 0.0.0.0:53 (DNS) and 0.0.0.0:853 (DoT)
+    # without docker-proxy overhead. The VPS firewall must allow 53/udp, 53/tcp, 853/tcp.
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+      - /etc/letsencrypt/live/dns.bastion.cam/fullchain.pem:/certs/fullchain.pem:ro
+      - /etc/letsencrypt/live/dns.bastion.cam/privkey.pem:/certs/privkey.pem:ro
+      - /etc/letsencrypt/archive/dns.bastion.cam:/etc/letsencrypt/archive/dns.bastion.cam:ro
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "/app/blocky", "healthcheck"]
+      interval: 1m
+      timeout: 5s
+      retries: 3

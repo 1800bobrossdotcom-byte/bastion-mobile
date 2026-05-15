@@ -1,0 +1,95 @@
+# Blocky config for bastion DoT resolver
+# https://0xerr0r.github.io/blocky/main/configuration/
+
+ports:
+  dns: 53                  # plain DNS (UDP+TCP) — used for fallback / debugging
+  tls: 853                 # DNS-over-TLS, the one Android Private DNS uses
+  http: 4000               # internal metrics + admin (NOT exposed publicly)
+
+# TLS cert for DoT. Mounted from /etc/letsencrypt by docker-compose.
+certFile: /certs/fullchain.pem
+keyFile: /certs/privkey.pem
+
+# Upstream resolvers — DoT to public privacy resolvers, no plaintext.
+upstreams:
+  groups:
+    default:
+      - tcp-tls:1.1.1.1:853
+      - tcp-tls:1.0.0.1:853
+      - tcp-tls:9.9.9.9:853
+  strategy: parallel_best   # query all, take fastest answer
+  timeout: 2s
+
+# Connection-level health check / startup probe.
+bootstrapDns:
+  - upstream: tcp-tls:1.1.1.1:853
+
+# Blocking config — the whole point.
+blocking:
+  denylists:
+    ads:
+      # Standard ad/tracker baseline
+      - https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+    malware:
+      # The two feeds bastion-mobile already uses + MalwareBazaar (was TODO in app build)
+      - https://urlhaus.abuse.ch/downloads/hostfile/
+      - https://openphish.com/feed.txt
+      - https://bazaar.abuse.ch/export/txt/domains/recent/
+    privacy:
+      # Telemetry / tracking lists from oisd (curated, low false positive rate)
+      - https://big.oisd.nl/
+  allowlists:
+    ads:
+      - |
+        # Common false-positives we want to keep working
+        clients2.google.com
+        clients3.google.com
+        clients4.google.com
+        connectivitycheck.gstatic.com
+        www.gstatic.com
+  clientGroupsBlock:
+    default:
+      - ads
+      - malware
+      - privacy
+  blockType: zeroIp           # return 0.0.0.0 for blocked A queries (Android handles cleanly)
+  blockTTL: 6h
+  loading:
+    refreshPeriod: 4h         # re-fetch denylists every 4h
+    downloads:
+      timeout: 60s
+      attempts: 3
+      cooldown: 10s
+    strategy: blocking        # block startup until lists are loaded (safer than serving open)
+    maxErrorsPerSource: 5
+
+# Cache to reduce upstream load and speed up repeat queries.
+caching:
+  minTime: 5m
+  maxTime: 24h
+  maxItemsCount: 0            # unlimited
+  prefetching: true
+  prefetchExpires: 2h
+  prefetchThreshold: 5
+
+# Connection limits — VPS has 3.7GB RAM, plenty of headroom.
+connectionLimit: 1000
+
+# Query log — minimal. We DON'T want to keep per-user query history (privacy).
+queryLog:
+  type: console               # log to stdout only, no persistence
+  logRetentionDays: 0
+  creationAttempts: 1
+  creationCooldownMs: 0
+
+# Prometheus metrics for monitoring (only exposed on 127.0.0.1:4000).
+prometheus:
+  enable: true
+  path: /metrics
+
+# Logging
+log:
+  level: info
+  format: text
+  timestamp: true
+  privacy: true               # redact client IPs in logs
