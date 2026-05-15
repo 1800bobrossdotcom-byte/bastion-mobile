@@ -1,0 +1,33 @@
+name: build-blocklist
+on:
+  schedule:
+    - cron: "13 */12 * * *"  # every 12h
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: [".github/workflows/build-blocklist.yml", "blocklist/**"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build merged blocklist
+        run: |
+          mkdir -p dist
+          python3 blocklist/build.py > dist/blocklist.txt
+          echo "Generated $(wc -l < dist/blocklist.txt) hostnames"
+          head -20 dist/blocklist.txt
+
+      - name: Publish to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+          publish_branch: gh-pages
+          force_orphan: true
+          commit_message: "blocklist: refresh ${{ github.run_number }}"

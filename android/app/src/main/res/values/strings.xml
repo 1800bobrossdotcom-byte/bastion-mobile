@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BASTION</string>
+    <string name="vpn_notification_title">BASTION sensor active</string>
+    <string name="vpn_notification_body">Filtering DNS against malware + phishing blocklist.</string>
+    <string name="vpn_channel_name">BASTION sensor</string>
+</resources>

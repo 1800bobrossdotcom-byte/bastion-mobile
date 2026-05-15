@@ -1,0 +1,39 @@
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/captures/
+android/.cxx/
+android/app/release/
+*.keystore
+*.jks
+keystore.properties
+
+# Gradle wrapper jar (regenerate locally)
+# gradle/wrapper/gradle-wrapper.jar  -- keep this committed when generated
+
+# iOS
+ios/build/
+ios/DerivedData/
+ios/*.xcodeproj/
+ios/*.xcworkspace/
+ios/Pods/
+ios/Podfile.lock
+ios/.build/
+ios/*.xcuserstate
+ios/xcuserdata/
+
+# Generated blocklist artifacts
+blocklist/cache/
+blocklist/dist/
+
+# General
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.env
+.env.local
+node_modules/

@@ -1,0 +1,66 @@
+# xcodegen project spec for BASTION mobile (iOS)
+# Generate the Xcode project on macOS with: xcodegen generate
+
+name: Bastion
+options:
+  bundleIdPrefix: cam.bastion.mobile
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: "" # fill from Apple Developer account before archive
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+targets:
+  Bastion:
+    type: application
+    platform: iOS
+    sources:
+      - Bastion
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cam.bastion.mobile
+        INFOPLIST_FILE: Bastion/Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_OBJC_BRIDGING_HEADER: ""
+    dependencies:
+      - target: BastionTunnel
+        embed: true
+        codeSign: true
+    info:
+      path: Bastion/Info.plist
+      properties:
+        CFBundleDisplayName: BASTION
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchStoryboardName: ""
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: false
+
+  BastionTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - BastionTunnel
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cam.bastion.mobile.tunnel
+        INFOPLIST_FILE: BastionTunnel/Info.plist
+    info:
+      path: BastionTunnel/Info.plist
+      properties:
+        CFBundleDisplayName: BASTION Tunnel
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
