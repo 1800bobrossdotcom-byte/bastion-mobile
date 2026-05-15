@@ -106,7 +106,7 @@ private fun TopBar(tab: Tab) {
         Column(Modifier.weight(1f)) {
             Text("BASTION", color = PHOSPHOR, fontFamily = MONO, fontSize = 22.sp,
                 fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
-            Text("v0.4.0 :: ${tab.short} ${tab.long}", color = INK_DIM,
+            Text("v0.4.1 :: ${tab.short} ${tab.long}", color = INK_DIM,
                 fontFamily = MONO, fontSize = 10.sp, letterSpacing = 2.sp)
         }
         Pulse()
@@ -764,17 +764,35 @@ private fun SpectrumCanvas(buckets: FloatArray, running: Boolean) {
         val h = size.height
         val n = buckets.size
         if (n == 0) return@Canvas
+
+        // Horizontal grid: -20 / -55 (alert) / -75 / -100 dBFS reference lines.
+        // Map matches the bar mapping below: -110..-20 dBFS → 0..1 of height.
+        fun yForDb(db: Float): Float {
+            val v = ((db + 110f) / 90f).coerceIn(0f, 1f)
+            return h - v * h
+        }
+        drawLine(BORDER, Offset(0f, yForDb(-100f)), Offset(w, yForDb(-100f)), 1f)
+        drawLine(BORDER, Offset(0f, yForDb(-75f)),  Offset(w, yForDb(-75f)),  1f)
+        drawLine(
+            AMBER.copy(alpha = 0.35f),
+            Offset(0f, yForDb(-55f)), Offset(w, yForDb(-55f)), 1f,
+        )
+
         val cw = w / n
         val gap = 2f
         for (i in 0 until n) {
             val db = buckets[i]
-            // Map -90..0 dBFS → 0..1
-            val v = ((db + 90f) / 90f).coerceIn(0f, 1f)
-            val barH = v * h
+            // Wider range so the typical ultrasonic noise floor (-95..-110)
+            // still produces a visible bar and beacons at -55..-30 fill most
+            // of the canvas.
+            val v = ((db + 110f) / 90f).coerceIn(0f, 1f)
+            // Always at least 1px so the spectrum is visible at idle.
+            val barH = (v * h).coerceAtLeast(1f)
             val color = when {
                 db > -55f -> AMBER
                 db > -75f -> PHOSPHOR
-                else -> PHOSPHOR.copy(alpha = if (running) 0.45f else 0.18f)
+                db > -95f -> PHOSPHOR.copy(alpha = if (running) 0.55f else 0.22f)
+                else      -> PHOSPHOR.copy(alpha = if (running) 0.30f else 0.12f)
             }
             drawRect(
                 color = color,
@@ -1099,7 +1117,7 @@ private fun AboutScreen() {
         SectionHeader("changelog")
         Spacer(Modifier.height(8.dp))
         BodyBlock(
-            "v0.4.0 — Added three sensors: ECHO (ultrasonic-beacon spectrum monitor, " +
+            "v0.4.1 — Added three sensors: ECHO (ultrasonic-beacon spectrum monitor, " +
                 "18–22 kHz FFT), NET (per-app data-usage ledger, requires Usage Access), " +
                 "SCAN (front-cam shoulder-surfer detection via on-device ML Kit face " +
                 "detection — frames never leave the phone).",
@@ -1119,7 +1137,7 @@ private fun AboutScreen() {
         BodyBlock(
             "source:   github.com/1800bobrossdotcom-byte/bastion-mobile",
             "issues:   github.com/1800bobrossdotcom-byte/bastion-mobile/issues",
-            "version:  0.4.0 (build 11)",
+            "version:  0.4.0 (build 12)",
         )
         Spacer(Modifier.height(24.dp))
     }
