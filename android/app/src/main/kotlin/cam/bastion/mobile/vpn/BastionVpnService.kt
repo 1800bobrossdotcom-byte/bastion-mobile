@@ -44,6 +44,8 @@ class BastionVpnService : VpnService() {
         private const val TAG = "BastionVPN"
         private const val NOTIF_ID = 1001
         private const val CHANNEL_ID = "bastion-sensor"
+        /** True between onStartCommand returning and onDestroy completing. UI reads this. */
+        @Volatile var isRunning: Boolean = false; private set
     }
 
     private var tun: ParcelFileDescriptor? = null
@@ -52,16 +54,22 @@ class BastionVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIF_ID, buildNotification())
         startVpn()
+        isRunning = true
         return START_STICKY
     }
 
     private fun startVpn() {
         val upstream = Settings.resolver(applicationContext).ip
+        // DNS-ONLY ROUTING: only packets destined for the upstream DNS server
+        // travel through our tun. Everything else (web, apps, IPv6) keeps using
+        // the underlying network. Without this, the entire phone's internet
+        // dies the moment we capture 0.0.0.0/0 because we drop non-DNS packets.
         tun = Builder()
             .setSession("BASTION")
-            .addAddress("10.42.0.2", 24)
-            .addRoute("0.0.0.0", 0)
+            .addAddress("10.42.0.2", 30)
+            .addRoute(upstream, 32)
             .addDnsServer(upstream)
+            .allowFamily(android.system.OsConstants.AF_INET)
             .setMtu(1500)
             .establish() ?: run {
                 Log.e(TAG, "VpnService.Builder.establish() returned null")
@@ -188,6 +196,7 @@ class BastionVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        isRunning = false
         scope.cancel()
         try { tun?.close() } catch (_: Throwable) {}
         super.onDestroy()

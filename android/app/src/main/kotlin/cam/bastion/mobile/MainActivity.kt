@@ -49,6 +49,7 @@ import cam.bastion.mobile.theme.BORDER
 import cam.bastion.mobile.theme.PHOSPHOR
 import cam.bastion.mobile.theme.SURFACE
 import cam.bastion.mobile.vpn.BastionVpnService
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -78,6 +79,7 @@ fun BastionApp() {
     Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
         Column(Modifier.fillMaxSize().background(Color.Black)) {
             TopBar(tab)
+            ServiceStatusStrip()
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 when (tab) {
                     Tab.SENSOR -> SensorScreen()
@@ -102,12 +104,63 @@ private fun TopBar(tab: Tab) {
         Column(Modifier.weight(1f)) {
             Text("BASTION", color = PHOSPHOR, fontFamily = MONO, fontSize = 22.sp,
                 fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
-            Text("v0.2.1 :: ${tab.short} ${tab.long}", color = INK_DIM,
+            Text("v0.2.2 :: ${tab.short} ${tab.long}", color = INK_DIM,
                 fontFamily = MONO, fontSize = 10.sp, letterSpacing = 2.sp)
         }
         Pulse()
     }
     Divider(color = BORDER, thickness = 1.dp)
+}
+
+/**
+ * Persistent two-pill status row visible on every tab so the user can see at a
+ * glance that Sensor and Shield run independently and can be active together.
+ */
+@Composable
+private fun ServiceStatusStrip() {
+    var sensorOn by remember { mutableStateOf(BastionVpnService.isRunning) }
+    var shieldMode by remember { mutableStateOf(AcousticShieldService.currentMode) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            sensorOn = BastionVpnService.isRunning
+            shieldMode = AcousticShieldService.currentMode
+            delay(400)
+        }
+    }
+    val shieldOn = shieldMode != AcousticShieldService.Mode.OFF
+    Row(
+        Modifier.fillMaxWidth().background(Color.Black)
+            .padding(horizontal = 20.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        StatusPill("SENSOR", if (sensorOn) "ON" else "OFF", sensorOn, Modifier.weight(1f))
+        StatusPill("SHIELD",
+            if (shieldOn) shieldMode.name else "OFF",
+            shieldOn, Modifier.weight(1f))
+    }
+    Divider(color = BORDER.copy(alpha = 0.6f), thickness = 1.dp)
+}
+
+@Composable
+private fun StatusPill(label: String, value: String, on: Boolean, modifier: Modifier) {
+    val color = if (on) PHOSPHOR else INK_DIM
+    Row(
+        modifier
+            .background(if (on) PHOSPHOR.copy(alpha = 0.10f) else Color.Transparent,
+                RoundedCornerShape(2.dp))
+            .border(1.dp, if (on) PHOSPHOR.copy(alpha = 0.6f) else BORDER,
+                RoundedCornerShape(2.dp))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.size(7.dp).clip(CircleShape).background(color))
+        Spacer(Modifier.width(8.dp))
+        Text(label, color = INK_DIM, fontFamily = MONO, fontSize = 9.sp,
+            letterSpacing = 2.sp)
+        Spacer(Modifier.weight(1f))
+        Text(value, color = color, fontFamily = MONO, fontSize = 11.sp,
+            fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+    }
 }
 
 @Composable
@@ -151,7 +204,10 @@ private fun BottomTabs(active: Tab, onSelect: (Tab) -> Unit) {
 @Composable
 private fun SensorScreen() {
     val ctx = LocalContext.current
-    var sensorActive by rememberSaveable { mutableStateOf(false) }
+    var sensorActive by remember { mutableStateOf(BastionVpnService.isRunning) }
+    LaunchedEffect(Unit) {
+        while (true) { sensorActive = BastionVpnService.isRunning; delay(400) }
+    }
     val dao = remember { AuditDb.get(ctx).dao() }
     val count by dao.countFlow().collectAsStateWithLifecycle(initialValue = 0)
 
@@ -194,8 +250,9 @@ private fun SensorScreen() {
         }
         Spacer(Modifier.height(28.dp))
         Disclaimer(
-            "BASTION watches DNS. It blocks lookups against URLhaus + OpenPhish " +
-                "but cannot stop spyware, see other apps' traffic, or detect Pegasus."
+            "BASTION watches DNS only — it routes DNS lookups through itself " +
+                "to filter URLhaus + OpenPhish. All other traffic uses your normal " +
+                "network. It cannot stop spyware or detect Pegasus."
         )
     }
 }
